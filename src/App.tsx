@@ -240,6 +240,8 @@ const styles = StyleSheet.create({
   container: {flex: 1, backgroundColor: '#000000'},
   nativeVideoContainer: {
     ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#000000',
+    overflow: 'hidden',
     zIndex: 0,
   },
   webview: {flex: 1, backgroundColor: 'transparent', zIndex: 1},

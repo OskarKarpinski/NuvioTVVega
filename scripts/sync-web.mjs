@@ -50,6 +50,15 @@ if (!indexHtml.includes("nuvio.i18n.js")) {
   await writeFile(indexPath, indexHtml, "utf8");
 }
 
+const webViewStylesPath = path.join(vegaRoot, "node_modules", "@amazon-devices", "webview", "dist", "spec", "WebView.styles.js");
+try {
+  let stylesContent = await readFile(webViewStylesPath, "utf8");
+  if (stylesContent.includes('backgroundColor: "#ffffff"')) {
+    stylesContent = stylesContent.replace('backgroundColor: "#ffffff"', 'backgroundColor: "transparent"');
+    await writeFile(webViewStylesPath, stylesContent, "utf8");
+  }
+} catch (_) {}
+
 console.log(
   `Synced NuvioTVSmart/dist -> ${targetWebDir} (inlined ${Object.keys(bundles).length} i18n locales)`
 );

@@ -2,7 +2,9 @@
   "name": "@amazon-devices/nuviotvvega",
   "version": "0.0.1",
   "private": true,
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "clean": "rm -rf node_modules buildinfo.json dist build",
     "start": "react-native start",
@@ -16,9 +18,10 @@
     "build:app": "npm-run-all build:release",
     "build": "npm-run-all build:release",
     "release": "npm-run-all lint test build:app"
-    },
+  },
   "dependencies": {
     "@amazon-devices/react-native-kepler": "~4.0.0",
+    "@amazon-devices/react-native-w3cmedia": "^2.3.5",
     "@amazon-devices/webview": "~4.0.0",
     "react": "19.2.0",
     "react-native": "0.83.0"
@@ -27,8 +30,8 @@
     "node": ">=20"
   },
   "devDependencies": {
-    "@amazon-devices/kepler-cli-platform": "^0",
     "@amazon-devices/eslint-plugin-kepler": "^0.1.4",
+    "@amazon-devices/kepler-cli-platform": "^0",
     "@react-native-community/cli": "20.0.0",
     "@react-native/babel-preset": "0.83.0",
     "@react-native/eslint-config": "0.83.0",
@@ -38,10 +41,10 @@
     "@types/react": "^19.2.0",
     "@types/react-test-renderer": "^19.1.0",
     "@typescript-eslint/eslint-plugin": "^6.5.0",
-    "jest": "^29.7.0",
     "babel-jest": "^29.7.0",
     "eslint": "^8.57.1",
     "eslint-plugin-jest": "^27.6.0",
+    "jest": "^29.7.0",
     "jsonc-eslint-parser": "^2.4.0",
     "npm-run-all": "^4.1.5",
     "prettier": "^2.8.8",
@@ -52,7 +55,9 @@
   "kepler": {
     "projectType": "application",
     "appName": "NuvioTVVega",
-    "targets": ["tv"]
+    "targets": [
+      "tv"
+    ]
   },
   "overrides": {
     "react": "19.2.0",

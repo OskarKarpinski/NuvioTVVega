@@ -28,6 +28,9 @@ export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  const seekTimeoutRef = useRef<any>(null);
+  const isSeekingRef = useRef<boolean>(false);
+  const targetSeekSecRef = useRef<number>(0);
   usePreventHideSplashScreen();
   const hideSplashScreenCallback = useHideSplashScreenCallback();
 
@@ -98,14 +101,28 @@ export const App = () => {
               break;
             case 'seek':
               if (typeof payload.positionMs === 'number' && videoRef.current) {
+                const targetSec = Math.max(0, payload.positionMs / 1000);
+                targetSeekSecRef.current = targetSec;
+                isSeekingRef.current = true;
+                if (seekTimeoutRef.current) {
+                  clearTimeout(seekTimeoutRef.current);
+                }
                 try {
-                  videoRef.current.currentTime = Math.max(
-                    0,
-                    payload.positionMs / 1000,
-                  );
+                  videoRef.current.currentTime = targetSec;
                 } catch (err) {
                   console.warn('[VegaPlayer] seek error:', err);
                 }
+                // Fallback: if native onSeeked does not fire within 300ms, dispatch synthetic seeked
+                seekTimeoutRef.current = setTimeout(() => {
+                  seekTimeoutRef.current = null;
+                  if (isSeekingRef.current) {
+                    isSeekingRef.current = false;
+                    sendEventToWeb({
+                      name: 'seeked',
+                      currentTime: videoRef.current?.currentTime ?? targetSec,
+                    });
+                  }
+                }, 300);
               }
               break;
             case 'rate':
@@ -125,6 +142,11 @@ export const App = () => {
               }
               break;
             case 'close':
+              if (seekTimeoutRef.current) {
+                clearTimeout(seekTimeoutRef.current);
+                seekTimeoutRef.current = null;
+              }
+              isSeekingRef.current = false;
               setVideoUrl('');
               break;
           }
@@ -167,15 +189,32 @@ export const App = () => {
             onPause={() => sendEventToWeb({name: 'pause'})}
             onWaiting={() => sendEventToWeb({name: 'waiting'})}
             onSeeked={() => {
+              if (seekTimeoutRef.current) {
+                clearTimeout(seekTimeoutRef.current);
+                seekTimeoutRef.current = null;
+              }
+              isSeekingRef.current = false;
+              const current = videoRef.current?.currentTime;
               sendEventToWeb({
                 name: 'seeked',
-                currentTime: videoRef.current?.currentTime,
+                currentTime:
+                  typeof current === 'number' && !Number.isNaN(current)
+                    ? current
+                    : targetSeekSecRef.current,
               });
             }}
             onTimeUpdate={() => {
+              const current = videoRef.current?.currentTime;
+              if (
+                isSeekingRef.current &&
+                typeof current === 'number' &&
+                Math.abs(current - targetSeekSecRef.current) > 2.0
+              ) {
+                return;
+              }
               sendEventToWeb({
                 name: 'timeupdate',
-                currentTime: videoRef.current?.currentTime,
+                currentTime: current,
                 duration: videoRef.current?.duration,
               });
             }}

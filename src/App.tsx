@@ -1,6 +1,6 @@
 import {WebView} from '@amazon-devices/webview';
 import * as React from 'react';
-import {useCallback, useRef} from 'react';
+import {useCallback, useRef, useState} from 'react';
 import {BackHandler, StyleSheet, View} from 'react-native';
 import {
   useHideSplashScreenCallback,
@@ -25,6 +25,7 @@ const INJECTED_PRELOAD_JS = `
 export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
+  const [videoUrl, setVideoUrl] = useState<string>('');
   usePreventHideSplashScreen();
   const hideSplashScreenCallback = useHideSplashScreenCallback();
 
@@ -49,60 +50,66 @@ export const App = () => {
 
         if (payload?.type === 'NUVIO_VEGA_PLAYER') {
           const {action} = payload;
-          const video = videoRef.current;
-          if (!video) {
-            return;
-          }
 
           switch (action) {
             case 'open':
               if (payload.url) {
-                video.src = payload.url;
+                setVideoUrl(payload.url);
               }
               break;
             case 'prepare':
               if (
-                video.readyState >= 2 ||
-                (video.duration && video.duration > 0)
+                videoRef.current &&
+                (videoRef.current.readyState >= 2 ||
+                  (videoRef.current.duration && videoRef.current.duration > 0))
               ) {
                 sendEventToWeb({
                   name: 'canplay',
-                  duration: video.duration,
-                  currentTime: video.currentTime,
+                  duration: videoRef.current.duration,
+                  currentTime: videoRef.current.currentTime,
                 });
               }
               break;
             case 'play':
               try {
-                video.play()?.catch?.((err: any) => {
+                videoRef.current?.play()?.catch?.((err: any) => {
                   console.error('[VegaPlayer] play failed:', err);
-                  sendEventToWeb({name: 'error', error: String(err)});
+                  sendEventToWeb({
+                    name: 'error',
+                    error: err?.message || 'Playback failed to start',
+                  });
                 });
-              } catch (err) {
+              } catch (err: any) {
                 console.error('[VegaPlayer] play error:', err);
-                sendEventToWeb({name: 'error', error: String(err)});
+                sendEventToWeb({
+                  name: 'error',
+                  error: err?.message || 'Playback failed to start',
+                });
               }
               break;
             case 'pause':
               try {
-                video.pause();
+                videoRef.current?.pause();
               } catch (err) {
                 console.warn('[VegaPlayer] pause error:', err);
               }
               break;
             case 'seek':
-              if (typeof payload.positionMs === 'number') {
+              if (typeof payload.positionMs === 'number' && videoRef.current) {
                 try {
-                  video.currentTime = Math.max(0, payload.positionMs / 1000);
+                  videoRef.current.currentTime = Math.max(
+                    0,
+                    payload.positionMs / 1000,
+                  );
                 } catch (err) {
                   console.warn('[VegaPlayer] seek error:', err);
                 }
               }
               break;
             case 'rate':
-              if (typeof payload.rate === 'number') {
+              if (typeof payload.rate === 'number' && videoRef.current) {
                 try {
-                  video.playbackRate = payload.rate;
+                  videoRef.current.playbackRate = payload.rate;
                 } catch (err) {
                   console.warn('[VegaPlayer] rate error:', err);
                 }
@@ -110,18 +117,13 @@ export const App = () => {
               break;
             case 'stop':
               try {
-                video.pause();
+                videoRef.current?.pause();
               } catch (err) {
                 console.warn('[VegaPlayer] stop error:', err);
               }
               break;
             case 'close':
-              try {
-                video.pause();
-                video.src = '';
-              } catch (err) {
-                console.warn('[VegaPlayer] close error:', err);
-              }
+              setVideoUrl('');
               break;
           }
         }
@@ -134,51 +136,59 @@ export const App = () => {
 
   return (
     <View style={styles.container}>
-      <View style={styles.nativeVideoContainer}>
-        <Video
-          ref={videoRef}
-          width={1920}
-          height={1080}
-          controls={false}
-          playsInline={true}
-          showCaptions={false}
-          scalingmode="fit"
-          onCanPlay={() => {
-            sendEventToWeb({
-              name: 'canplay',
-              duration: videoRef.current?.duration,
-              currentTime: videoRef.current?.currentTime,
-            });
-          }}
-          onLoadedMetadata={() => {
-            sendEventToWeb({
-              name: 'loadedmetadata',
-              duration: videoRef.current?.duration,
-            });
-          }}
-          onPlaying={() => sendEventToWeb({name: 'playing'})}
-          onPause={() => sendEventToWeb({name: 'pause'})}
-          onWaiting={() => sendEventToWeb({name: 'waiting'})}
-          onSeeked={() => {
-            sendEventToWeb({
-              name: 'seeked',
-              currentTime: videoRef.current?.currentTime,
-            });
-          }}
-          onTimeUpdate={() => {
-            sendEventToWeb({
-              name: 'timeupdate',
-              currentTime: videoRef.current?.currentTime,
-              duration: videoRef.current?.duration,
-            });
-          }}
-          onEnded={() => sendEventToWeb({name: 'ended'})}
-          onError={(err: any) => {
-            console.error('[Vega Video onError]', err);
-            sendEventToWeb({name: 'error', error: String(err)});
-          }}
-        />
-      </View>
+      {videoUrl ? (
+        <View style={styles.nativeVideoContainer}>
+          <Video
+            ref={videoRef}
+            key={videoUrl}
+            src={videoUrl}
+            width={1920}
+            height={1080}
+            controls={false}
+            playsInline={true}
+            showCaptions={false}
+            scalingmode="fit"
+            onCanPlay={() => {
+              sendEventToWeb({
+                name: 'canplay',
+                duration: videoRef.current?.duration,
+                currentTime: videoRef.current?.currentTime,
+              });
+            }}
+            onLoadedMetadata={() => {
+              sendEventToWeb({
+                name: 'loadedmetadata',
+                duration: videoRef.current?.duration,
+              });
+            }}
+            onPlaying={() => sendEventToWeb({name: 'playing'})}
+            onPause={() => sendEventToWeb({name: 'pause'})}
+            onWaiting={() => sendEventToWeb({name: 'waiting'})}
+            onSeeked={() => {
+              sendEventToWeb({
+                name: 'seeked',
+                currentTime: videoRef.current?.currentTime,
+              });
+            }}
+            onTimeUpdate={() => {
+              sendEventToWeb({
+                name: 'timeupdate',
+                currentTime: videoRef.current?.currentTime,
+                duration: videoRef.current?.duration,
+              });
+            }}
+            onEnded={() => sendEventToWeb({name: 'ended'})}
+            onError={(err: any) => {
+              const mediaErr = err?.target?.error || videoRef.current?.error;
+              const msg = mediaErr
+                ? `${mediaErr.message || 'Playback error'} (code ${mediaErr.code})`
+                : err?.message || 'Native player error';
+              console.error('[Vega Video onError]', msg, err);
+              sendEventToWeb({name: 'error', error: msg});
+            }}
+          />
+        </View>
+      ) : null}
       <WebView
         ref={webRef}
         style={styles.webview}

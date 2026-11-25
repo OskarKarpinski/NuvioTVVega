@@ -1,7 +1,7 @@
 import {WebView} from '@amazon-devices/webview';
 import * as React from 'react';
 import {useCallback, useRef, useState} from 'react';
-import {BackHandler, StyleSheet, View} from 'react-native';
+import {BackHandler, Dimensions, StyleSheet, View} from 'react-native';
 import {
   useHideSplashScreenCallback,
   usePreventHideSplashScreen,
@@ -21,6 +21,8 @@ const INJECTED_PRELOAD_JS = `
   })();
   true;
 `;
+
+const {width: WINDOW_WIDTH, height: WINDOW_HEIGHT} = Dimensions.get('window');
 
 export const App = () => {
   const webRef = useRef<any>(null);
@@ -142,8 +144,8 @@ export const App = () => {
             ref={videoRef}
             key={videoUrl}
             src={videoUrl}
-            width={1920}
-            height={1080}
+            width={WINDOW_WIDTH || 1920}
+            height={WINDOW_HEIGHT || 1080}
             controls={false}
             playsInline={true}
             showCaptions={false}
@@ -237,11 +239,7 @@ export const App = () => {
 const styles = StyleSheet.create({
   container: {flex: 1, backgroundColor: '#000000'},
   nativeVideoContainer: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    width: 1920,
-    height: 1080,
+    ...StyleSheet.absoluteFillObject,
     zIndex: 0,
   },
   webview: {flex: 1, backgroundColor: 'transparent', zIndex: 1},

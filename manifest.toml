@@ -4,7 +4,7 @@ schema-version = 1
 title = "Nuvio TV"
 version = "1.4.6"
 # Floor so local builds pass vpt validate; pass an increasing --build-number for every Appstore upload.
-build-number = 8
+build-number = 9
 id = "com.nuvio.tv.vega"
 icon = "@image/default_app_icon.png"
 

@@ -28,6 +28,8 @@ export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  const [customHeaders, setCustomHeaders] = useState<Record<string, string> | null>(null);
+  const customHeadersRef = useRef<Record<string, string> | null>(null);
   const [showCaptions, setShowCaptions] = useState<boolean>(true);
   const seekTimeoutRef = useRef<any>(null);
   const isSeekingRef = useRef<boolean>(false);
@@ -111,10 +113,59 @@ export const App = () => {
           switch (action) {
             case 'open':
               if (payload.url) {
+                const headers =
+                  payload.headers &&
+                  typeof payload.headers === 'object' &&
+                  Object.keys(payload.headers).length > 0
+                    ? payload.headers
+                    : null;
+                customHeadersRef.current = headers;
+                setCustomHeaders(headers);
                 setVideoUrl(payload.url);
+                if (videoRef.current) {
+                  if (headers && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
+                    try {
+                      videoRef.current.setSrcWithCustomHeaders(payload.url, headers);
+                    } catch (e) {
+                      console.warn('[VegaPlayer] open setSrcWithCustomHeaders error:', e);
+                    }
+                  } else {
+                    try {
+                      videoRef.current.src = payload.url;
+                    } catch (e) {
+                      console.warn('[VegaPlayer] open src error:', e);
+                    }
+                  }
+                }
+              }
+              break;
+            case 'setHeaders':
+              if (payload.headers && typeof payload.headers === 'object') {
+                const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
+                customHeadersRef.current = merged;
+                setCustomHeaders(merged);
+                if (videoRef.current && videoUrl && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
+                  try {
+                    videoRef.current.setSrcWithCustomHeaders(videoUrl, merged);
+                  } catch (e) {
+                    console.warn('[VegaPlayer] setHeaders setSrcWithCustomHeaders error:', e);
+                  }
+                }
               }
               break;
             case 'prepare':
+              if (payload.headers && typeof payload.headers === 'object') {
+                const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
+                customHeadersRef.current = merged;
+                setCustomHeaders(merged);
+                if (videoRef.current && (payload.url || videoUrl) && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
+                  try {
+                    videoRef.current.setSrcWithCustomHeaders(payload.url || videoUrl, merged);
+                  } catch (e) {
+                    console.warn('[VegaPlayer] prepare setSrcWithCustomHeaders error:', e);
+                  }
+                }
+              }
               if (
                 videoRef.current &&
                 (videoRef.current.readyState >= 2 ||
@@ -259,6 +310,8 @@ export const App = () => {
               }
               isSeekingRef.current = false;
               setVideoUrl('');
+              setCustomHeaders(null);
+              customHeadersRef.current = null;
               break;
           }
         }
@@ -276,13 +329,25 @@ export const App = () => {
           <Video
             ref={videoRef}
             key={videoUrl}
-            src={videoUrl}
+            src={customHeaders ? undefined : videoUrl}
+            autoplay={true}
+            preload="auto"
             width={WINDOW_WIDTH || 1920}
             height={WINDOW_HEIGHT || 1080}
             controls={false}
             playsInline={true}
             showCaptions={showCaptions}
             scalingmode="fit"
+            onComponentDidMount={() => {
+              if (customHeadersRef.current && videoRef.current && videoUrl) {
+                try {
+                  console.info('[VegaPlayer] Applying headers on mount for:', videoUrl);
+                  videoRef.current.setSrcWithCustomHeaders(videoUrl, customHeadersRef.current);
+                } catch (err) {
+                  console.warn('[VegaPlayer] onComponentDidMount setSrcWithCustomHeaders error:', err);
+                }
+              }
+            }}
             onCanPlay={() => {
               sendEventToWeb({
                 name: 'canplay',
@@ -309,6 +374,10 @@ export const App = () => {
             }}
             onPause={() => sendEventToWeb({name: 'pause'})}
             onWaiting={() => sendEventToWeb({name: 'waiting'})}
+            onStalled={() => {
+              console.warn('[Vega Video onStalled]');
+              sendEventToWeb({name: 'stalled'});
+            }}
             onSeeked={() => {
               if (seekTimeoutRef.current) {
                 clearTimeout(seekTimeoutRef.current);
@@ -347,11 +416,20 @@ export const App = () => {
               }
               isSeekingRef.current = false;
               const mediaErr = err?.target?.error || videoRef.current?.error;
+              const code = mediaErr?.code || (typeof err?.code === 'number' ? err.code : 4);
               const msg = mediaErr
                 ? `${mediaErr.message || 'Playback error'} (code ${mediaErr.code})`
                 : err?.message || 'Native player error';
-              console.error('[Vega Video onError]', msg, err);
-              sendEventToWeb({name: 'error', error: msg});
+              console.error('[Vega Video onError]', msg, err, mediaErr);
+              sendEventToWeb({
+                name: 'error',
+                error: msg,
+                code,
+                details: {
+                  message: mediaErr?.message || err?.message,
+                  code,
+                },
+              });
             }}
           />
         </View>

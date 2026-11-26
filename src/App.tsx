@@ -44,12 +44,40 @@ export const App = () => {
     }
   }, []);
 
+  const extractAudioTracks = useCallback(() => {
+    const tracks: Array<{index: number; label: string; language: string; enabled: boolean}> = [];
+    try {
+      const list = videoRef.current?.audioTracks;
+      if (list && typeof list.length === 'number') {
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i];
+          if (item) {
+            tracks.push({
+              index: i,
+              label: item.label || item.language || '',
+              language: item.language || 'und',
+              enabled: Boolean(item.enabled),
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Vega] extractAudioTracks error:', e);
+    }
+    return tracks;
+  }, []);
+
   const handleMessage = useCallback(
     (event: WebViewMessageEvent) => {
       try {
         const payload = JSON.parse(event.nativeEvent.data);
         if (payload?.type === 'NUVIO_EXIT_APP') {
           BackHandler.exitApp();
+          return;
+        }
+
+        if (payload?.type === 'NUVIO_WAKE_LOCK') {
+          console.info('[Vega] NUVIO_WAKE_LOCK:', payload.active);
           return;
         }
 
@@ -72,6 +100,7 @@ export const App = () => {
                   name: 'canplay',
                   duration: videoRef.current.duration,
                   currentTime: videoRef.current.currentTime,
+                  audioTracks: extractAudioTracks(),
                 });
               }
               break;
@@ -125,6 +154,24 @@ export const App = () => {
                 }, 300);
               }
               break;
+            case 'selectAudioTrack':
+              if (videoRef.current?.audioTracks && typeof payload.index === 'number') {
+                try {
+                  const list = videoRef.current.audioTracks;
+                  for (let i = 0; i < list.length; i++) {
+                    if (list[i]) {
+                      list[i].enabled = i === payload.index;
+                    }
+                  }
+                  sendEventToWeb({
+                    name: 'audiotracks',
+                    audioTracks: extractAudioTracks(),
+                  });
+                } catch (err) {
+                  console.warn('[VegaPlayer] selectAudioTrack error:', err);
+                }
+              }
+              break;
             case 'rate':
               if (typeof payload.rate === 'number' && videoRef.current) {
                 try {
@@ -155,7 +202,7 @@ export const App = () => {
         // Ignore non-JSON messages from web content.
       }
     },
-    [sendEventToWeb],
+    [sendEventToWeb, extractAudioTracks],
   );
 
   return (
@@ -177,12 +224,14 @@ export const App = () => {
                 name: 'canplay',
                 duration: videoRef.current?.duration,
                 currentTime: videoRef.current?.currentTime,
+                audioTracks: extractAudioTracks(),
               });
             }}
             onLoadedMetadata={() => {
               sendEventToWeb({
                 name: 'loadedmetadata',
                 duration: videoRef.current?.duration,
+                audioTracks: extractAudioTracks(),
               });
             }}
             onPlaying={() => sendEventToWeb({name: 'playing'})}
@@ -220,6 +269,11 @@ export const App = () => {
             }}
             onEnded={() => sendEventToWeb({name: 'ended'})}
             onError={(err: any) => {
+              if (seekTimeoutRef.current) {
+                clearTimeout(seekTimeoutRef.current);
+                seekTimeoutRef.current = null;
+              }
+              isSeekingRef.current = false;
               const mediaErr = err?.target?.error || videoRef.current?.error;
               const msg = mediaErr
                 ? `${mediaErr.message || 'Playback error'} (code ${mediaErr.code})`

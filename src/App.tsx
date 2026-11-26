@@ -28,6 +28,7 @@ export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  const [showCaptions, setShowCaptions] = useState<boolean>(true);
   const seekTimeoutRef = useRef<any>(null);
   const isSeekingRef = useRef<boolean>(false);
   const targetSeekSecRef = useRef<number>(0);
@@ -67,6 +68,29 @@ export const App = () => {
     return tracks;
   }, []);
 
+  const extractTextTracks = useCallback(() => {
+    const tracks: Array<{index: number; label: string; language: string; mode: string}> = [];
+    try {
+      const list = videoRef.current?.textTracks;
+      if (list && typeof list.length === 'number') {
+        for (let i = 0; i < list.length; i++) {
+          const item = list[i];
+          if (item) {
+            tracks.push({
+              index: i,
+              label: item.label || item.language || `Subtitle ${i + 1}`,
+              language: item.language || 'und',
+              mode: item.mode || 'disabled',
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Vega] extractTextTracks error:', e);
+    }
+    return tracks;
+  }, []);
+
   const handleMessage = useCallback(
     (event: WebViewMessageEvent) => {
       try {
@@ -101,6 +125,7 @@ export const App = () => {
                   duration: videoRef.current.duration,
                   currentTime: videoRef.current.currentTime,
                   audioTracks: extractAudioTracks(),
+                  textTracks: extractTextTracks(),
                 });
               }
               break;
@@ -172,6 +197,45 @@ export const App = () => {
                 }
               }
               break;
+            case 'selectTextTrack':
+              if (videoRef.current?.textTracks && typeof payload.index === 'number') {
+                try {
+                  const list = videoRef.current.textTracks;
+                  setShowCaptions(true);
+                  for (let i = 0; i < list.length; i++) {
+                    if (list[i]) {
+                      list[i].mode = i === payload.index ? 'showing' : 'disabled';
+                    }
+                  }
+                  sendEventToWeb({
+                    name: 'texttracks',
+                    textTracks: extractTextTracks(),
+                  });
+                } catch (err) {
+                  console.warn('[VegaPlayer] selectTextTrack error:', err);
+                }
+              }
+              break;
+            case 'setSilentSubtitle':
+              try {
+                const silent = Boolean(payload.silent);
+                setShowCaptions(!silent);
+                const list = videoRef.current?.textTracks;
+                if (list && typeof list.length === 'number') {
+                  for (let i = 0; i < list.length; i++) {
+                    if (list[i] && silent) {
+                      list[i].mode = 'disabled';
+                    }
+                  }
+                }
+                sendEventToWeb({
+                  name: 'texttracks',
+                  textTracks: extractTextTracks(),
+                });
+              } catch (err) {
+                console.warn('[VegaPlayer] setSilentSubtitle error:', err);
+              }
+              break;
             case 'rate':
               if (typeof payload.rate === 'number' && videoRef.current) {
                 try {
@@ -202,7 +266,7 @@ export const App = () => {
         // Ignore non-JSON messages from web content.
       }
     },
-    [sendEventToWeb, extractAudioTracks],
+    [sendEventToWeb, extractAudioTracks, extractTextTracks],
   );
 
   return (
@@ -217,7 +281,7 @@ export const App = () => {
             height={WINDOW_HEIGHT || 1080}
             controls={false}
             playsInline={true}
-            showCaptions={false}
+            showCaptions={showCaptions}
             scalingmode="fit"
             onCanPlay={() => {
               sendEventToWeb({
@@ -225,6 +289,7 @@ export const App = () => {
                 duration: videoRef.current?.duration,
                 currentTime: videoRef.current?.currentTime,
                 audioTracks: extractAudioTracks(),
+                textTracks: extractTextTracks(),
               });
             }}
             onLoadedMetadata={() => {
@@ -232,9 +297,16 @@ export const App = () => {
                 name: 'loadedmetadata',
                 duration: videoRef.current?.duration,
                 audioTracks: extractAudioTracks(),
+                textTracks: extractTextTracks(),
               });
             }}
-            onPlaying={() => sendEventToWeb({name: 'playing'})}
+            onPlaying={() => {
+              sendEventToWeb({
+                name: 'playing',
+                audioTracks: extractAudioTracks(),
+                textTracks: extractTextTracks(),
+              });
+            }}
             onPause={() => sendEventToWeb({name: 'pause'})}
             onWaiting={() => sendEventToWeb({name: 'waiting'})}
             onSeeked={() => {

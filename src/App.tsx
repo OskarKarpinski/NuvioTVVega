@@ -18,86 +18,95 @@ import {
 const INJECTED_PRELOAD_JS = `
   (function () {
     window.__NUVIO_PLATFORM__ = "vega";
+    window.__NUVIO_VEGA_EVENT_QUEUE__ = window.__NUVIO_VEGA_EVENT_QUEUE__ || [];
+    window.__NUVIO_VEGA_DELIVER_EVENT__ = function (eventObj) {
+      var bridge = window.__NUVIO_VEGA_PLAYER__;
+      if (bridge && typeof bridge._handleNativeEvent === "function") {
+        try {
+          bridge._handleNativeEvent(eventObj);
+          return true;
+        } catch (error) {
+          window.__NUVIO_VEGA_EVENT_QUEUE__.push({event: eventObj, error: String(error)});
+        }
+      } else {
+        window.__NUVIO_VEGA_EVENT_QUEUE__.push({event: eventObj});
+      }
+      if (window.__NUVIO_VEGA_EVENT_QUEUE__.length > 20) {
+        window.__NUVIO_VEGA_EVENT_QUEUE__.shift();
+      }
+      return false;
+    };
+    window.__NUVIO_VEGA_DRAIN_EVENTS__ = function () {
+      var queue = window.__NUVIO_VEGA_EVENT_QUEUE__ || [];
+      window.__NUVIO_VEGA_EVENT_QUEUE__ = [];
+      queue.forEach(function (entry) {
+        if (!entry || !entry.event) return;
+        try { window.__NUVIO_VEGA_DELIVER_EVENT__(entry.event); } catch (_) {}
+      });
+      return true;
+    };
   })();
   true;
 `;
 
 const {width: WINDOW_WIDTH, height: WINDOW_HEIGHT} = Dimensions.get('window');
 
+const NATIVE_PREROLL_TIMEOUT_MS = 15000;
+const MAX_NATIVE_LOGS = 40;
+
 export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
+  const [playbackKey, setPlaybackKey] = useState<number>(0);
   const [customHeaders, setCustomHeaders] = useState<Record<string, string> | null>(null);
   const customHeadersRef = useRef<Record<string, string> | null>(null);
   const [showCaptions, setShowCaptions] = useState<boolean>(true);
   const seekTimeoutRef = useRef<any>(null);
+  const prerollWatchdogRef = useRef<any>(null);
+  const hasPlayedOrCanPlayRef = useRef<boolean>(false);
   const isSeekingRef = useRef<boolean>(false);
   const targetSeekSecRef = useRef<number>(0);
   const appliedSrcRef = useRef<{url: string; headersStr: string} | null>(null);
+  const nativeLogsRef = useRef<Array<string>>([]);
   usePreventHideSplashScreen();
   const hideSplashScreenCallback = useHideSplashScreenCallback();
+
+  const pushNativeLog = useCallback((tag: string, detail?: string) => {
+    try {
+      const target = videoRef.current;
+      const rs = target?.readyState ?? '-';
+      const ns = target?.networkState ?? '-';
+      const ts = new Date().toISOString().slice(11, 23);
+      const entry = `${ts} [${tag}] rs=${rs} ns=${ns}${detail ? ` ${detail}` : ''}`;
+      const logs = nativeLogsRef.current;
+      logs.push(entry);
+      if (logs.length > MAX_NATIVE_LOGS) {
+        logs.splice(0, logs.length - MAX_NATIVE_LOGS);
+      }
+    } catch (_) {
+      // Ignore logging errors.
+    }
+  }, []);
+
+  const clearPrerollWatchdog = useCallback(() => {
+    if (prerollWatchdogRef.current) {
+      clearTimeout(prerollWatchdogRef.current);
+      prerollWatchdogRef.current = null;
+    }
+  }, []);
 
   const sendEventToWeb = useCallback((eventObj: any) => {
     try {
       const serialized = JSON.stringify(eventObj);
-      const script = `try { window.__NUVIO_VEGA_PLAYER__ && window.__NUVIO_VEGA_PLAYER__._handleNativeEvent(${serialized}); } catch(_) {}; true;`;
-      webRef.current?.injectJavaScript(script);
+      const script = `try { window.__NUVIO_VEGA_DELIVER_EVENT__ && window.__NUVIO_VEGA_DELIVER_EVENT__(${serialized}); } catch(_) {}; true;`;
+      if (webRef.current?.injectJavaScript) {
+        webRef.current.injectJavaScript(script);
+      }
     } catch (e) {
       console.warn('[Vega] sendEventToWeb error:', e);
     }
   }, []);
-
-  const setVideoSource = useCallback((url: string, headers: Record<string, string> | null) => {
-    if (!url) return;
-    const target = videoRef.current;
-    if (!target) {
-      console.warn('[VegaPlayer] videoRef.current is null when setting source for:', url);
-      return;
-    }
-    const hasHeaders = Boolean(
-      headers && typeof headers === 'object' && Object.keys(headers).length > 0,
-    );
-    const headersStr = hasHeaders ? JSON.stringify(headers) : '';
-    if (
-      appliedSrcRef.current &&
-      appliedSrcRef.current.url === url &&
-      appliedSrcRef.current.headersStr === headersStr
-    ) {
-      return;
-    }
-    appliedSrcRef.current = { url, headersStr };
-
-    const player = (target as any)?.mediaPlayer_ || target;
-    try {
-      if (hasHeaders && typeof player?.setSrcWithCustomHeaders === 'function') {
-        console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders with headers:', url, headers);
-        player.setSrcWithCustomHeaders(url, headers);
-      } else {
-        // Never call player.setSrcWithCustomHeaders(url, null) because Vega W3CMedia IDL
-        // throws InvalidInputError on null headers and aborts the GStreamer pipeline.
-        if (target.src !== url) {
-          console.info('[VegaPlayer] Setting target.src:', url);
-          target.src = url;
-        } else {
-          console.info('[VegaPlayer] target.src matches, keeping pipeline intact:', url);
-        }
-      }
-    } catch (err) {
-      console.warn('[VegaPlayer] setVideoSource error:', err);
-    }
-  }, []);
-
-  React.useEffect(() => {
-    const hasHeaders = Boolean(
-      customHeadersRef.current &&
-      typeof customHeadersRef.current === 'object' &&
-      Object.keys(customHeadersRef.current).length > 0,
-    );
-    if (videoUrl && videoRef.current && hasHeaders) {
-      setVideoSource(videoUrl, customHeadersRef.current);
-    }
-  }, [videoUrl, setVideoSource]);
 
   const extractAudioTracks = useCallback(() => {
     const tracks: Array<{index: number; id: string; kind: string; label: string; language: string; enabled: boolean}> = [];
@@ -147,6 +156,112 @@ export const App = () => {
     return tracks;
   }, []);
 
+  const forwardNativeError = useCallback(
+    (reason: string, message: string, code: number = 4, extra: Record<string, any> = {}) => {
+      const target = videoRef.current;
+      const diagnosticLogs = [...nativeLogsRef.current];
+      pushNativeLog('forwardError', `${reason}: ${message}`);
+      sendEventToWeb({
+        name: 'error',
+        error: message,
+        code,
+        details: {
+          reason,
+          message,
+          code,
+          readyState: target?.readyState ?? 0,
+          networkState: target?.networkState ?? 0,
+          duration: target?.duration ?? 0,
+          audioTracks: extractAudioTracks(),
+          textTracks: extractTextTracks(),
+          diagnosticLogs,
+          ...extra,
+        },
+      });
+    },
+    [extractAudioTracks, extractTextTracks, pushNativeLog, sendEventToWeb],
+  );
+
+  const reportNativeActionFailure = useCallback(
+    (action: string, err: any) => {
+      const message = err?.message || err?.name || String(err || `${action} failed`);
+      console.warn(`[VegaPlayer] ${action} failed:`, err);
+      forwardNativeError('native-action-failure', `${action}: ${message}`, 4, {action});
+    },
+    [forwardNativeError],
+  );
+
+  const setVideoSource = useCallback((url: string, headers: Record<string, string> | null) => {
+    if (!url) return;
+    const target = videoRef.current;
+    if (!target) {
+      console.warn('[VegaPlayer] videoRef.current is null when setting source for:', url);
+      pushNativeLog('setVideoSource:no_ref');
+      return;
+    }
+    const hasHeaders = Boolean(
+      headers && typeof headers === 'object' && Object.keys(headers).length > 0,
+    );
+    const headersStr = hasHeaders ? JSON.stringify(headers) : '';
+    if (
+      appliedSrcRef.current &&
+      appliedSrcRef.current.url === url &&
+      appliedSrcRef.current.headersStr === headersStr
+    ) {
+      return;
+    }
+    const player = (target as any)?.mediaPlayer_ || target;
+    try {
+      if (hasHeaders) {
+        if (typeof player?.setSrcWithCustomHeaders !== 'function') {
+          const message = 'Native player cannot apply request headers (setSrcWithCustomHeaders unavailable)';
+          pushNativeLog('setVideoSource:no_header_api', message);
+          forwardNativeError('native-headers-unsupported', message, 4, {url});
+          return;
+        }
+        console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders with headers:', url, headers);
+        pushNativeLog('setSrcWithCustomHeaders', `headers=${Object.keys(headers!).join(',')}`);
+        player.setSrcWithCustomHeaders(url, headers);
+      } else {
+        // Never call player.setSrcWithCustomHeaders(url, null) because Vega W3CMedia IDL
+        // throws InvalidInputError on null headers and aborts the GStreamer pipeline.
+        if (target.src !== url) {
+          console.info('[VegaPlayer] Setting target.src:', url);
+          pushNativeLog('setSrc:direct');
+          target.src = url;
+        } else {
+          console.info('[VegaPlayer] target.src matches, keeping pipeline intact:', url);
+        }
+      }
+      appliedSrcRef.current = { url, headersStr };
+    } catch (err: any) {
+      const message = err?.message || err?.name || String(err || 'setVideoSource failed');
+      pushNativeLog('setVideoSource:error', message);
+      forwardNativeError('native-source-setup-failed', `setVideoSource: ${message}`, 4, {url});
+    }
+  }, [forwardNativeError, pushNativeLog]);
+
+  React.useEffect(() => {
+    const hasHeaders = Boolean(
+      customHeadersRef.current &&
+      typeof customHeadersRef.current === 'object' &&
+      Object.keys(customHeadersRef.current).length > 0,
+    );
+    if (videoUrl && videoRef.current && hasHeaders) {
+      setVideoSource(videoUrl, customHeadersRef.current);
+    }
+  }, [videoUrl, playbackKey, setVideoSource]);
+
+  React.useEffect(() => {
+    return () => {
+      clearPrerollWatchdog();
+      if (seekTimeoutRef.current) {
+        clearTimeout(seekTimeoutRef.current);
+        seekTimeoutRef.current = null;
+      }
+    };
+  }, [clearPrerollWatchdog]);
+
   const handleMessage = useCallback(
     (event: WebViewMessageEvent) => {
       try {
@@ -167,6 +282,9 @@ export const App = () => {
           switch (action) {
             case 'open':
               if (payload.url) {
+                clearPrerollWatchdog();
+                hasPlayedOrCanPlayRef.current = false;
+                nativeLogsRef.current = [];
                 const headers =
                   payload.headers &&
                   typeof payload.headers === 'object' &&
@@ -176,10 +294,55 @@ export const App = () => {
                 customHeadersRef.current = headers;
                 setCustomHeaders(headers);
                 appliedSrcRef.current = null;
+                pushNativeLog('open', `hasHeaders=${Boolean(headers)}`);
+                setPlaybackKey((prev) => prev + 1);
                 setVideoUrl(payload.url);
-                if (videoRef.current && headers) {
-                  setVideoSource(payload.url, headers);
-                }
+
+                prerollWatchdogRef.current = setTimeout(() => {
+                  prerollWatchdogRef.current = null;
+                  if (hasPlayedOrCanPlayRef.current) {
+                    return;
+                  }
+                  const target = videoRef.current;
+                  const readyState = Number(target?.readyState ?? 0);
+                  // Do not treat readyState >= 2 as success: the GStreamer pipeline can
+                  // expose metadata and then stall forever before canplay/playing.
+                  const networkState = Number(target?.networkState ?? 0);
+                  const duration = target?.duration;
+                  const audioTracks = extractAudioTracks();
+                  const textTracks = extractTextTracks();
+                  pushNativeLog('preroll_timeout', `dur=${duration ?? '-'} audio=${audioTracks.length}`);
+                  const diagnosticLogs = [...nativeLogsRef.current];
+                  console.warn('[VegaPlayer] Native preroll timeout:', {
+                    url: payload.url,
+                    readyState,
+                    networkState,
+                    duration,
+                    audioTracks,
+                    diagnosticLogs,
+                  });
+                  try {
+                    target?.pause?.();
+                  } catch (_) {
+                    // The watchdog still reports the original failure if pausing fails.
+                  }
+                  sendEventToWeb({
+                    name: 'error',
+                    error: 'Vega native player preroll timeout (pipeline stalled before canplay)',
+                    code: 4,
+                    details: {
+                      reason: 'native-preroll-timeout',
+                      readyState,
+                      networkState,
+                      duration,
+                      audioTracks,
+                      textTracks,
+                      diagnosticLogs,
+                    },
+                  });
+                }, NATIVE_PREROLL_TIMEOUT_MS);
+              } else {
+                forwardNativeError('native-open-invalid-url', 'Native player received an empty playback URL', 4);
               }
               break;
             case 'setHeaders':
@@ -208,34 +371,25 @@ export const App = () => {
                   }
                 }
               }
-              if (
-                videoRef.current &&
-                (videoRef.current.readyState >= 2 ||
-                  (videoRef.current.duration && videoRef.current.duration > 0))
-              ) {
-                sendEventToWeb({
-                  name: 'canplay',
-                  duration: videoRef.current.duration,
-                  currentTime: videoRef.current.currentTime,
-                  audioTracks: extractAudioTracks(),
-                  textTracks: extractTextTracks(),
-                });
-              }
+              pushNativeLog('prepare');
+              // Never synthesize canplay from readyState. Only the real Video onCanPlay
+              // callback may resolve prepareAsync(); a stalled audio pipeline can expose
+              // HAVE_CURRENT_DATA without ever becoming playable.
               break;
             case 'play':
               try {
                 videoRef.current?.play()?.catch?.((err: any) => {
-                  console.warn('[VegaPlayer] play rejected:', err);
+                  reportNativeActionFailure('play', err);
                 });
               } catch (err: any) {
-                console.error('[VegaPlayer] play error:', err);
+                reportNativeActionFailure('play', err);
               }
               break;
             case 'pause':
               try {
                 videoRef.current?.pause();
               } catch (err) {
-                console.warn('[VegaPlayer] pause error:', err);
+                reportNativeActionFailure('pause', err);
               }
               break;
             case 'seek':
@@ -249,7 +403,7 @@ export const App = () => {
                 try {
                   videoRef.current.currentTime = targetSec;
                 } catch (err) {
-                  console.warn('[VegaPlayer] seek error:', err);
+                  reportNativeActionFailure('seek', err);
                 }
                 // Fallback: if native onSeeked does not fire within 300ms, dispatch synthetic seeked
                 seekTimeoutRef.current = setTimeout(() => {
@@ -278,7 +432,7 @@ export const App = () => {
                     audioTracks: extractAudioTracks(),
                   });
                 } catch (err) {
-                  console.warn('[VegaPlayer] selectAudioTrack error:', err);
+                  reportNativeActionFailure('selectAudioTrack', err);
                 }
               }
               break;
@@ -297,7 +451,7 @@ export const App = () => {
                     textTracks: extractTextTracks(),
                   });
                 } catch (err) {
-                  console.warn('[VegaPlayer] selectTextTrack error:', err);
+                  reportNativeActionFailure('selectTextTrack', err);
                 }
               }
               break;
@@ -318,7 +472,7 @@ export const App = () => {
                   textTracks: extractTextTracks(),
                 });
               } catch (err) {
-                console.warn('[VegaPlayer] setSilentSubtitle error:', err);
+                reportNativeActionFailure('setSilentSubtitle', err);
               }
               break;
             case 'rate':
@@ -326,18 +480,23 @@ export const App = () => {
                 try {
                   videoRef.current.playbackRate = payload.rate;
                 } catch (err) {
-                  console.warn('[VegaPlayer] rate error:', err);
+                  reportNativeActionFailure('rate', err);
                 }
               }
               break;
             case 'stop':
+              clearPrerollWatchdog();
+              pushNativeLog('stop');
               try {
                 videoRef.current?.pause();
               } catch (err) {
-                console.warn('[VegaPlayer] stop error:', err);
+                reportNativeActionFailure('stop', err);
               }
               break;
             case 'close':
+              clearPrerollWatchdog();
+              hasPlayedOrCanPlayRef.current = false;
+              pushNativeLog('close');
               if (seekTimeoutRef.current) {
                 clearTimeout(seekTimeoutRef.current);
                 seekTimeoutRef.current = null;
@@ -354,7 +513,17 @@ export const App = () => {
         // Ignore non-JSON messages from web content.
       }
     },
-    [sendEventToWeb, extractAudioTracks, extractTextTracks, videoUrl, setVideoSource],
+    [
+      sendEventToWeb,
+      forwardNativeError,
+      reportNativeActionFailure,
+      extractAudioTracks,
+      extractTextTracks,
+      videoUrl,
+      setVideoSource,
+      clearPrerollWatchdog,
+      pushNativeLog,
+    ],
   );
 
   return (
@@ -363,7 +532,7 @@ export const App = () => {
         <View style={styles.nativeVideoContainer}>
           <Video
             ref={videoRef}
-            key={videoUrl}
+            key={`${playbackKey}:${videoUrl}`}
             src={customHeaders ? undefined : videoUrl}
             autoplay={true}
             preload="auto"
@@ -375,6 +544,7 @@ export const App = () => {
             scalingmode="fit"
             onComponentDidMount={() => {
               console.info('[VegaPlayer] onComponentDidMount fired for:', videoUrl);
+              pushNativeLog('mount');
               const hasHeaders = Boolean(
                 customHeadersRef.current &&
                 typeof customHeadersRef.current === 'object' &&
@@ -387,6 +557,9 @@ export const App = () => {
               }
             }}
             onCanPlay={() => {
+              hasPlayedOrCanPlayRef.current = true;
+              clearPrerollWatchdog();
+              pushNativeLog('canplay', `dur=${videoRef.current?.duration ?? '-'}`);
               sendEventToWeb({
                 name: 'canplay',
                 duration: videoRef.current?.duration,
@@ -396,6 +569,7 @@ export const App = () => {
               });
             }}
             onLoadedMetadata={() => {
+              pushNativeLog('loadedmetadata', `dur=${videoRef.current?.duration ?? '-'}`);
               sendEventToWeb({
                 name: 'loadedmetadata',
                 duration: videoRef.current?.duration,
@@ -404,17 +578,38 @@ export const App = () => {
               });
             }}
             onPlaying={() => {
+              hasPlayedOrCanPlayRef.current = true;
+              clearPrerollWatchdog();
+              pushNativeLog('playing');
               sendEventToWeb({
                 name: 'playing',
                 audioTracks: extractAudioTracks(),
                 textTracks: extractTextTracks(),
               });
             }}
-            onPause={() => sendEventToWeb({name: 'pause'})}
-            onWaiting={() => sendEventToWeb({name: 'waiting'})}
+            onPause={() => {
+              pushNativeLog('pause');
+              sendEventToWeb({name: 'pause'});
+            }}
+            onWaiting={() => {
+              pushNativeLog('waiting');
+              sendEventToWeb({
+                name: 'waiting',
+                readyState: videoRef.current?.readyState ?? 0,
+                networkState: videoRef.current?.networkState ?? 0,
+                duration: videoRef.current?.duration ?? 0,
+                diagnosticLogs: [...nativeLogsRef.current],
+              });
+            }}
             onStalled={() => {
-              console.warn('[Vega Video onStalled]');
-              sendEventToWeb({name: 'stalled'});
+              pushNativeLog('stalled');
+              sendEventToWeb({
+                name: 'stalled',
+                readyState: videoRef.current?.readyState ?? 0,
+                networkState: videoRef.current?.networkState ?? 0,
+                duration: videoRef.current?.duration ?? 0,
+                diagnosticLogs: [...nativeLogsRef.current],
+              });
             }}
             onSeeked={() => {
               if (seekTimeoutRef.current) {
@@ -446,8 +641,12 @@ export const App = () => {
                 duration: videoRef.current?.duration,
               });
             }}
-            onEnded={() => sendEventToWeb({name: 'ended'})}
+            onEnded={() => {
+              pushNativeLog('ended');
+              sendEventToWeb({name: 'ended'});
+            }}
             onError={(err: any) => {
+              clearPrerollWatchdog();
               if (seekTimeoutRef.current) {
                 clearTimeout(seekTimeoutRef.current);
                 seekTimeoutRef.current = null;
@@ -455,18 +654,15 @@ export const App = () => {
               isSeekingRef.current = false;
               const mediaErr = err?.target?.error || videoRef.current?.error;
               const code = mediaErr?.code || (typeof err?.code === 'number' ? err.code : 4);
-              const msg = mediaErr
-                ? `${mediaErr.message || 'Playback error'} (code ${mediaErr.code})`
-                : err?.message || 'Native player error';
+              const rawMessage =
+                mediaErr?.message || err?.message || err?.name || 'Native player error';
+              const msg = mediaErr?.code
+                ? `${rawMessage} (code ${mediaErr.code})`
+                : rawMessage;
               console.error('[Vega Video onError]', msg, err, mediaErr);
-              sendEventToWeb({
-                name: 'error',
-                error: msg,
-                code,
-                details: {
-                  message: mediaErr?.message || err?.message,
-                  code,
-                },
+              forwardNativeError('native-media-error', msg, code, {
+                sourceError: rawMessage,
+                errorName: err?.name,
               });
             }}
           />
@@ -476,11 +672,8 @@ export const App = () => {
         ref={webRef}
         style={styles.webview}
         allowFileAccess
-        allowFileAccessFromFileURLs
-        allowUniversalAccessFromFileURLs
         allowSystemKeyEvents
         allowsDefaultMediaControl={false}
-        allowsInlineMediaPlayback
         domStorageEnabled
         hasTVPreferredFocus
         javaScriptEnabled
@@ -493,6 +686,13 @@ export const App = () => {
         onMessage={handleMessage}
         onLoad={(_event: WebViewNavigationEvent) => {
           console.info('Page loading completed...');
+          try {
+            webRef.current?.injectJavaScript(
+              'try { window.__NUVIO_VEGA_DRAIN_EVENTS__ && window.__NUVIO_VEGA_DRAIN_EVENTS__(); } catch (_) {}; true;',
+            );
+          } catch (e) {
+            console.warn('[Vega] drain events failed:', e);
+          }
           hideSplashScreenCallback();
         }}
         onLoadStart={(_event: WebViewNavigationEvent) => {
@@ -501,16 +701,28 @@ export const App = () => {
         onError={({
           nativeEvent: {code, url, description},
         }: WebViewErrorEvent) => {
-          console.error(`[onError]: (${code}: ${url}) ${description}`);
+          const message = description || `WebView failed to load ${url}`;
+          console.error(`[onError]: (${code}: ${url}) ${message}`);
+          hideSplashScreenCallback();
+          forwardNativeError('webview-load-error', message, code || 4, {url});
         }}
         onHttpError={({
           nativeEvent: {url, statusCode: code, description, isMainFrame},
         }: WebViewHttpErrorEvent) => {
-          console.error(`[onHttpError]: (${code}: ${url}) ${description}`);
-          console.error(`[onHttpError]: isMainFrame: ${isMainFrame}`);
+          const message = description || `HTTP ${code} while loading ${url}`;
+          console.error(`[onHttpError]: (${code}: ${url}) ${message}`);
+          hideSplashScreenCallback();
+          forwardNativeError('webview-http-error', message, code || 4, {url, isMainFrame});
         }}
-        onSslError={({code, url, description}: SslErrorData) => {
-          console.error(`[onSslError]: (${code}: ${url}) ${description}`);
+        onSslError={(
+          {code, url, description}: SslErrorData,
+          callback: {proceed: () => void; cancel: () => void},
+        ) => {
+          const message = description || `SSL error ${code} while loading ${url}`;
+          console.error(`[onSslError]: (${code}: ${url}) ${message}`);
+          callback?.cancel?.();
+          hideSplashScreenCallback();
+          forwardNativeError('webview-ssl-error', message, 4, {url});
         }}
       />
     </View>

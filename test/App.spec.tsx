@@ -6,10 +6,19 @@ jest.mock('@amazon-devices/webview', () => ({
   WebView: 'WebView',
 }));
 
+jest.mock('@amazon-devices/react-native-w3cmedia', () => ({
+  Video: 'Video',
+}));
+
 jest.mock('@amazon-devices/react-native-kepler', () => ({
   usePreventHideSplashScreen: jest.fn(),
   useHideSplashScreenCallback: jest.fn(() => jest.fn()),
-  StyleSheet: {create: (styles: unknown) => styles},
+  BackHandler: {exitApp: jest.fn()},
+  Dimensions: {get: () => ({width: 1920, height: 1080})},
+  StyleSheet: {
+    absoluteFillObject: {},
+    create: (styles: unknown) => styles,
+  },
   View: 'View',
 }));
 

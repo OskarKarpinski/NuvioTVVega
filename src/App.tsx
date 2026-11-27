@@ -53,6 +53,20 @@ const {width: WINDOW_WIDTH, height: WINDOW_HEIGHT} = Dimensions.get('window');
 
 const NATIVE_PREROLL_TIMEOUT_MS = 15000;
 const MAX_NATIVE_LOGS = 40;
+const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
+
+/**
+ * WebView onError/onHttpError also fires for failed subresources (poster images,
+ * thumbnails, fonts). Those are not playback failures: only the app document
+ * loading problem should be escalated to the player error screen.
+ */
+export const isMainWebviewDocument = (url?: string | null): boolean => {
+  if (!url) {
+    return true;
+  }
+  const normalized = url.split(/[?#]/)[0];
+  return normalized === WEBVIEW_MAIN_URL || normalized === 'about:blank';
+};
 
 export const App = () => {
   const webRef = useRef<any>(null);
@@ -703,6 +717,9 @@ export const App = () => {
         }: WebViewErrorEvent) => {
           const message = description || `WebView failed to load ${url}`;
           console.error(`[onError]: (${code}: ${url}) ${message}`);
+          if (!isMainWebviewDocument(url)) {
+            return;
+          }
           hideSplashScreenCallback();
           forwardNativeError('webview-load-error', message, code || 4, {url});
         }}
@@ -711,6 +728,9 @@ export const App = () => {
         }: WebViewHttpErrorEvent) => {
           const message = description || `HTTP ${code} while loading ${url}`;
           console.error(`[onHttpError]: (${code}: ${url}) ${message}`);
+          if (isMainFrame === false || !isMainWebviewDocument(url)) {
+            return;
+          }
           hideSplashScreenCallback();
           forwardNativeError('webview-http-error', message, code || 4, {url, isMainFrame});
         }}
@@ -721,6 +741,9 @@ export const App = () => {
           const message = description || `SSL error ${code} while loading ${url}`;
           console.error(`[onSslError]: (${code}: ${url}) ${message}`);
           callback?.cancel?.();
+          if (!isMainWebviewDocument(url)) {
+            return;
+          }
           hideSplashScreenCallback();
           forwardNativeError('webview-ssl-error', message, 4, {url});
         }}

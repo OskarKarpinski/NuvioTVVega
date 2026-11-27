@@ -620,17 +620,21 @@ std::vector<std::string> buildCommand(const std::shared_ptr<ProxySession>& sessi
   argv.push_back("2");
   argv.push_back("-c:s");
   argv.push_back("copy");
-  // Mark the requested track as the default in the Matroska header. The native
-  // player honours FlagDefault even when its runtime enable/disable API is
-  // unreliable, so an audio switch survives the remux for every source.
-  if (session->audioTrackIndex >= 0 && session->audioTrackIndex < session->audioTrackCount) {
-    for (int i = 0; i < session->audioTrackCount; ++i) {
-      std::ostringstream specifier;
-      specifier << "-disposition:a:" << i;
-      argv.push_back(specifier.str());
-      argv.push_back(i == session->audioTrackIndex ? "default" : "0");
-    }
-  }
+  // Exactly one audio track must be default. Sources with several default
+  // tracks make Vega's pipeline reconfigure itself in a loop and abort pending
+  // reconfigurations. The native player honours FlagDefault even when its
+  // runtime enable/disable API is unreliable, so this also makes audio
+  // switching survive the remux for every source.
+  argv.push_back("-disposition:a");
+  argv.push_back("0");
+  const int selectedAudio =
+      session->audioTrackIndex >= 0 && session->audioTrackIndex < session->audioTrackCount
+          ? session->audioTrackIndex
+          : 0;
+  std::ostringstream defaultSpecifier;
+  defaultSpecifier << "-disposition:a:" << selectedAudio;
+  argv.push_back(defaultSpecifier.str());
+  argv.push_back("default");
   // A SeekHead/Cues index would point at the end of a still-growing file; the
   // native demuxer would request those ranges before preroll and give up.
   argv.push_back("-write_index");

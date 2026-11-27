@@ -112,6 +112,52 @@ describe('App', () => {
     });
   });
 
+  it('rebuilds from the current position when the growing local file reports early EOS', async () => {
+    const startProxy = NuvioMediaProxy.startProxy as jest.Mock;
+    startProxy.mockClear();
+    const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
+    proxyStatus.mockReturnValue({
+      state: 'streaming',
+      bytesWritten: 1024 * 1024,
+      exitCode: 0,
+      error: '',
+      log: '',
+    });
+    const {UNSAFE_getByType} = render(<App />);
+    const webView = UNSAFE_getByType('WebView' as any);
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'open',
+            url: 'https://example.test/video.mkv',
+            headers: null,
+          }),
+        },
+      });
+    });
+    await waitFor(() => expect(startProxy).toHaveBeenCalledTimes(1));
+
+    const video = UNSAFE_getByType('Video' as any);
+    await act(async () => {
+      video.props.onEnded();
+    });
+
+    await waitFor(() => expect(startProxy).toHaveBeenCalledTimes(2));
+    const restart = startProxy.mock.calls[1][0];
+    expect(restart.startTimeSec).toBeGreaterThanOrEqual(0);
+    expect(restart.sessionId).not.toBe(startProxy.mock.calls[0][0].sessionId);
+    proxyStatus.mockReturnValue({
+      state: 'streaming',
+      bytesWritten: 0,
+      exitCode: 0,
+      error: '',
+      log: '',
+    });
+  });
+
   it('treats only the app document as a WebView load failure', () => {
     expect(isMainWebviewDocument('file:///pkg/assets/web/index.html')).toBe(true);
     expect(isMainWebviewDocument('file:///pkg/assets/web/index.html?v=2')).toBe(true);

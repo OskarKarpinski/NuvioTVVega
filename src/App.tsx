@@ -61,6 +61,10 @@ const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
 // new src before unlinking the previous one.
 const PROXY_RETIRE_DELAY_MS = 8000;
 const AUDIO_TRACK_POLL_MS = 500;
+// GStreamer sees the current end of a still-growing local MKV as EOS. When the
+// remuxer falls behind the player we silently rebuilt a few seconds earlier;
+// cap that recovery so a genuinely broken source still reaches the error UI.
+const MAX_PREMATURE_END_RECOVERIES = 3;
 
 type AudioTrackMetadata = {
   index: number;
@@ -104,6 +108,7 @@ export const App = () => {
   const audioSignatureRef = useRef<string>('');
   const proxyAudioMetadataRef = useRef<AudioTrackMetadata[]>([]);
   const retiredProxyTimersRef = useRef<any[]>([]);
+  const prematureEndCountRef = useRef<number>(0);
   const pendingSeekSecRef = useRef<number | null>(null);
   const proxyLogTailRef = useRef<string>('');
   const restartProxyAtRef = useRef<
@@ -699,6 +704,75 @@ export const App = () => {
   );
   restartProxyAtRef.current = restartProxyAt;
 
+  /**
+   * A file:// MKV is still being written by ffmpeg. GStreamer treats the
+   * current end of that file as EOS, so `ended` can arrive long before the
+   * movie is over. Distinguish that from a real end by asking the remuxer
+   * whether it is still streaming and whether it reported an error.
+   */
+  const handleNativeEnded = useCallback(() => {
+    const sessionId = proxySessionRef.current;
+    let status: ReturnType<typeof NuvioMediaProxy.proxyStatus> | null = null;
+    if (sessionId) {
+      try {
+        status = NuvioMediaProxy.proxyStatus(sessionId);
+      } catch (err) {
+        console.warn('[VegaPlayer] ended status failed:', err);
+      }
+    }
+    const timeSec = reportedTime();
+    const remuxFailed = Boolean(status?.error) ||
+      (status?.state === 'complete' && Number(status?.exitCode ?? 0) !== 0);
+    if (remuxFailed) {
+      pushNativeLog(
+        'ended_with_remux_error',
+        `time=${timeSec.toFixed(2)} state=${status?.state} exit=${status?.exitCode} error=${status?.error || ''}`,
+      );
+      captureProxyLog();
+      stopProxyPlayback();
+      forwardNativeError('proxy-stream-failed', status?.error || 'Remux failed', 4, {
+        url: sourceUrlRef.current,
+        proxyLog: proxyLogTailRef.current,
+      });
+      return;
+    }
+    const stillStreaming = Boolean(sessionId) && status?.state === 'streaming';
+    if (stillStreaming && prematureEndCountRef.current < MAX_PREMATURE_END_RECOVERIES) {
+      prematureEndCountRef.current += 1;
+      pushNativeLog(
+        'premature_end',
+        `time=${timeSec.toFixed(2)} bytes=${status?.bytesWritten ?? '-'} recovery=${prematureEndCountRef.current}`,
+      );
+      if (status?.log) {
+        pushNativeLog('proxy_log', status.log.slice(-600).replace(/\s+/g, ' '));
+      }
+      restartProxyAt(timeSec, undefined, false);
+      return;
+    }
+    if (stillStreaming) {
+      pushNativeLog('premature_end_giveup', `time=${timeSec.toFixed(2)}`);
+      captureProxyLog();
+      stopProxyPlayback();
+      forwardNativeError(
+        'proxy-stalled',
+        'The local remux stopped delivering frames before the movie ended',
+        4,
+        {url: sourceUrlRef.current, proxyLog: proxyLogTailRef.current},
+      );
+      return;
+    }
+    pushNativeLog('ended');
+    sendEventToWeb({name: 'ended'});
+  }, [
+    captureProxyLog,
+    forwardNativeError,
+    pushNativeLog,
+    reportedTime,
+    restartProxyAt,
+    sendEventToWeb,
+    stopProxyPlayback,
+  ]);
+
   const prepareSource = useCallback(async () => {
     const pending = pendingSourceRef.current;
     if (!pending) {
@@ -747,6 +821,7 @@ export const App = () => {
       preparingSourceRef.current = false;
       hasPlayedOrCanPlayRef.current = false;
       isSeekingRef.current = false;
+      prematureEndCountRef.current = 0;
       pendingSeekSecRef.current = null;
       proxyAudioMetadataRef.current = [];
       audioSignatureRef.current = '';
@@ -867,6 +942,7 @@ export const App = () => {
               }
               const targetSec = Math.max(0, payload.positionMs / 1000);
               targetSeekSecRef.current = targetSec;
+              prematureEndCountRef.current = 0;
               // The remuxed MKV deliberately has no cues index. Native seeks land
               // on a non-keyframe and the decoder reports "No valid frames
               // decoded", so every seek rebuilds the file from the target time.
@@ -1178,10 +1254,7 @@ export const App = () => {
                 duration: reportedDuration(),
               });
             }}
-            onEnded={() => {
-              pushNativeLog('ended');
-              sendEventToWeb({name: 'ended'});
-            }}
+            onEnded={handleNativeEnded}
             onError={(err: any) => {
               clearPrerollWatchdog();
               if (seekTimeoutRef.current) {

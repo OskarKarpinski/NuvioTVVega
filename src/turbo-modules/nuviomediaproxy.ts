@@ -6,7 +6,7 @@ export type MediaProxyConfig = {
   url: string;
   /** HTTP headers formatted as "Key: Value\n" pairs (LF terminator on Vega). */
   headers: string;
-  /** Initial playback position, applied when the local master is remuxed. */
+  /** Source position the first bounded segment starts at. */
   startTimeSec: number;
   /** Output audio stream to mark as default; -1 uses the first stream. */
   audioTrackIndex?: number;
@@ -16,7 +16,7 @@ export type MediaProxyConfig = {
 
 export type MediaPlaybackConfig = {
   sessionId: string;
-  /** Source position to start the generated local file from. */
+  /** Source position the rebuilt segment starts at. */
   startTimeSec: number;
   audioTrackIndex: number;
   audioTrackCount: number;
@@ -25,42 +25,50 @@ export type MediaPlaybackConfig = {
 };
 
 export type MediaProxyResult = {
-  /** file:// URI of the completed local playback file. */
+  /** file:// URI of the completed local segment. */
   localUrl: string;
   cachePath: string;
   logPath: string;
+  /** preparing | ready | error | missing */
   state: string;
   phase: string;
   playbackGeneration: number;
-  /** JSON array of audio streams discovered in the local master. */
+  /** JSON array of audio streams discovered from ffmpeg's stream list. */
   audioTracks?: string;
   error?: string;
 };
 
 export type MediaProxyStatus = {
-  /** preparing | remuxing | ready | error | missing */
+  /** preparing | ready | error | missing */
   state: string;
   phase: string;
+  /** Size of the in-flight temp file, or of the completed segment when ready. */
   bytesWritten: number;
-  masterBytes: number;
   exitCode: number;
   error: string;
   log: string;
   /** JSON array of audio streams discovered from ffmpeg's stream list. */
   audioTracks?: string;
   selfTest?: string;
+  /** Generation of the last fully written segment. */
   playbackGeneration: number;
-  playbackInFlightGeneration?: number;
-  playbackDone?: number;
-  playbackReady?: number;
+  /** Generation currently being built; -1 when idle. */
+  generationInFlight?: number;
+  /** 1 once the in-flight ffmpeg process has exited. */
+  segmentDone?: number;
+  /** 1 when ffmpeg exited cleanly but produced no playable data (true EOF). */
+  endOfStream?: number;
+  /** Precise diagnostic for a failed rebuild; empty when healthy. */
   playbackDiagnostic?: string;
-  masterComplete?: number;
+  localUrl?: string;
+  cachePath?: string;
+  logPath?: string;
 };
 
 export interface NuvioMediaProxy extends KeplerTurboModule {
-  /** Starts a one-time download into a local master file. Returns immediately. */
+  /** Starts one bounded local segment from the network. Returns immediately. */
   startProxy: (config: MediaProxyConfig) => MediaProxyResult;
-  /** Rebuilds the playback file from the local master (no network access). */
+  /** Rebuilds a bounded segment from the network at a new position/audio. */
   preparePlayback: (config: MediaPlaybackConfig) => MediaProxyResult;
   stopProxy: (sessionId: string) => boolean;
   proxyStatus: (sessionId: string) => MediaProxyStatus;

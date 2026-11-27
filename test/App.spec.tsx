@@ -19,13 +19,13 @@ jest.mock('../src/turbo-modules/nuviomediaproxy', () => ({
       cachePath: '/tmp/nuvio-proxy-test.mkv',
       logPath: '/tmp/nuvio-proxy-test.log',
       state: 'preparing',
-      phase: 'download',
+      phase: 'preparing',
       playbackGeneration: 0,
     })),
     preparePlayback: jest.fn((config) => ({
       localUrl: 'file:///tmp/nuvio-proxy-test.mkv',
-      state: 'remuxing',
-      phase: 'remux',
+      state: 'preparing',
+      phase: 'preparing',
       playbackGeneration: config.generation,
     })),
     stopProxy: jest.fn(() => true),
@@ -33,11 +33,13 @@ jest.mock('../src/turbo-modules/nuviomediaproxy', () => ({
       state: 'ready',
       phase: 'ready',
       bytesWritten: 1024 * 1024,
-      masterBytes: 8 * 1024 * 1024,
       exitCode: 0,
       error: '',
       log: '',
       playbackGeneration: 1,
+      generationInFlight: 1,
+      segmentDone: 1,
+      endOfStream: 0,
       audioTracks: JSON.stringify([
         {index: 0, language: 'eng', title: 'English', default: true},
         {index: 1, language: 'hin', title: 'Hindi', default: false},
@@ -63,15 +65,30 @@ const readyStatus = (generation: number = 1) => ({
   state: 'ready',
   phase: 'ready',
   bytesWritten: 1024 * 1024,
-  masterBytes: 8 * 1024 * 1024,
   exitCode: 0,
   error: '',
   log: '',
   playbackGeneration: generation,
+  generationInFlight: generation,
+  segmentDone: 1,
+  endOfStream: 0,
   audioTracks: JSON.stringify([
     {index: 0, language: 'eng', title: 'English', default: true},
     {index: 1, language: 'hin', title: 'Hindi', default: false},
   ]),
+});
+
+const preparingStatus = (generation: number = 1) => ({
+  state: 'preparing',
+  phase: 'preparing',
+  bytesWritten: 4096,
+  exitCode: 0,
+  error: '',
+  log: '',
+  playbackGeneration: generation - 1,
+  generationInFlight: generation,
+  segmentDone: 0,
+  endOfStream: 0,
 });
 
 const openVideo = async () => {
@@ -106,18 +123,9 @@ describe('App', () => {
     expect(toJSON()).toBeTruthy();
   });
 
-  it('mounts the native player only after the local file is complete', async () => {
+  it('mounts the native player only after the bounded segment is complete', async () => {
     const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
-    proxyStatus.mockReturnValue({
-      state: 'preparing',
-      phase: 'download',
-      bytesWritten: 0,
-      masterBytes: 0,
-      exitCode: 0,
-      error: '',
-      log: '',
-      playbackGeneration: 0,
-    });
+    proxyStatus.mockReturnValue(preparingStatus());
     const rendered = render(<App />);
     const {UNSAFE_getByType, UNSAFE_queryByType} = rendered;
     const webView = UNSAFE_getByType('WebView' as any);
@@ -144,7 +152,29 @@ describe('App', () => {
     rendered.unmount();
   });
 
-  it('rebuilds from the local master when audio changes, never re-downloading', async () => {
+  it('does not mount a stale ready segment from a superseded generation', async () => {
+    const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
+    proxyStatus.mockReturnValue(readyStatus(99));
+    const rendered = render(<App />);
+    const {UNSAFE_getByType, UNSAFE_queryByType} = rendered;
+    const webView = UNSAFE_getByType('WebView' as any);
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'open',
+            url: 'https://example.test/video.mkv',
+            headers: null,
+          }),
+        },
+      });
+    });
+    expect(UNSAFE_queryByType('Video' as any)).toBeNull();
+    rendered.unmount();
+  });
+
+  it('rebuilds from the network at the current time when audio changes', async () => {
     const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
     const preparePlayback = NuvioMediaProxy.preparePlayback as jest.Mock;
     proxyStatus.mockImplementation(() => {
@@ -172,14 +202,43 @@ describe('App', () => {
     expect(config.audioTrackIndex).toBe(1);
     expect(config.audioTrackCount).toBe(2);
     expect(config.sessionId).toBeTruthy();
+    // One session per source: an audio switch must not start a new download.
     expect(NuvioMediaProxy.startProxy).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
+    unmount();
+  });
 
+  it('rebuilds a bounded segment at the requested seek position', async () => {
+    const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
+    const preparePlayback = NuvioMediaProxy.preparePlayback as jest.Mock;
+    proxyStatus.mockImplementation(() => {
+      const call = preparePlayback.mock.calls[0];
+      return readyStatus(call ? call[0].generation : 1);
+    });
+    const {webView, UNSAFE_getByType, unmount} = await openVideo();
+    await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'seek',
+            positionMs: 420000,
+          }),
+        },
+      });
+    });
+
+    await waitFor(() => expect(preparePlayback).toHaveBeenCalled());
+    const config = preparePlayback.mock.calls[0][0];
+    expect(config.startTimeSec).toBe(420);
+    expect(NuvioMediaProxy.startProxy).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
     unmount();
   });
 
   it('ignores an early EOS instead of leaving the player or showing an error', async () => {
-    const startProxy = NuvioMediaProxy.startProxy as jest.Mock;
     const {UNSAFE_getByType, unmount} = await openVideo();
     await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
 
@@ -188,7 +247,7 @@ describe('App', () => {
       video.props.onEnded();
     });
 
-    expect(startProxy).toHaveBeenCalledTimes(1);
+    expect(NuvioMediaProxy.startProxy).toHaveBeenCalledTimes(1);
     expect(NuvioMediaProxy.preparePlayback).not.toHaveBeenCalled();
     unmount();
   });

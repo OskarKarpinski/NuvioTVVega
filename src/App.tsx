@@ -67,6 +67,13 @@ const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
 // avoids racing a remount with cleanup.
 const PROXY_RETIRE_DELAY_MS = 8000;
 const MEDIA_ERROR_RETRY_WINDOW_MS = 4000;
+// ffmpeg exits cleanly with an empty file when the requested source position
+// is at or past the end of the stream. That is a normal EOF, not a failure.
+const END_OF_STREAM_ERROR = 'END_OF_STREAM';
+// Start building the following bounded segment early enough that the native
+// remount at the boundary costs only a few frames. The native side caps each
+// segment at 192 MiB, so this is roughly a minute of playback in practice.
+const PREPARE_NEXT_AHEAD_SEC = 60;
 
 type AudioTrackMetadata = {
   index: number;
@@ -105,13 +112,22 @@ export const App = () => {
   const [playbackKey, setPlaybackKey] = useState<number>(0);
   const [showCaptions, setShowCaptions] = useState<boolean>(true);
 
-  // There is exactly one proxy session per source. The remote URL is fetched
-  // once into a complete local master; every seek/audio change rebuilds a
-  // second local file from that master. <Video> only ever sees a finished
-  // file:// MKV, never a growing file and never the remote URL.
+  // There is exactly one proxy session per source. Each ffmpeg run fetches one
+  // bounded segment from the network into a complete local MKV. <Video> only
+  // ever sees a finished file:// MKV, never a growing file and never the URL.
+  // Seeks and audio changes rebuild a segment from the new source position;
+  // the previous segment is unlinked by the native rename before the remount.
   const proxySessionRef = useRef<string | null>(null);
   const lastProxySessionRef = useRef<string | null>(null);
   const localUrlRef = useRef<string>('');
+  const segmentEndSecRef = useRef<number>(0);
+  const preparedNextRef = useRef<{
+    localUrl: string;
+    generation: number;
+    startSec: number;
+  } | null>(null);
+  const nextPrepInFlightRef = useRef<boolean>(false);
+  const endOfStreamRef = useRef<boolean>(false);
   const proxyPollRef = useRef<any>(null);
   const audioSignatureRef = useRef<string>('');
   const proxyAudioMetadataRef = useRef<AudioTrackMetadata[]>([]);
@@ -448,8 +464,9 @@ export const App = () => {
   );
 
   /**
-   * Waits for a complete playback file. A stalled local download or a failed
-   * local remux is a real failure; slow but progressing work is not.
+   * Waits for one complete bounded segment. Progress is measured from the
+   * in-flight temp file, so a slow network is never mistaken for a failure.
+   * Only a stalled download or a clean EOF is reported to the caller.
    */
   const waitForPlaybackReady = useCallback(
     (sessionId: string, generation: number) =>
@@ -479,8 +496,7 @@ export const App = () => {
             return;
           }
           const phase = String(status.phase || status.state || '');
-          const bytes =
-            Number(status.masterBytes || 0) + Number(status.bytesWritten || 0);
+          const bytes = Number(status.bytesWritten || 0);
           if (phase !== lastPhase || bytes > lastBytes) {
             lastPhase = phase;
             lastBytes = bytes;
@@ -491,17 +507,37 @@ export const App = () => {
             finish(reject, new Error(status.error));
             return;
           }
-          const failedRebuild =
-            Number(status.playbackDone ?? 0) === 1 &&
-            Number(status.playbackInFlightGeneration ?? 0) === generation &&
-            Number(status.playbackGeneration ?? 0) !== generation &&
-            Boolean(status.playbackDiagnostic);
-          if (failedRebuild) {
+          const buildDone =
+            Number(status.segmentDone ?? 0) === 1 &&
+            Number(status.generationInFlight ?? -1) === generation;
+          if (buildDone) {
+            if (
+              status.state === 'ready' &&
+              Number(status.playbackGeneration ?? 0) === generation
+            ) {
+              finish(resolve, status);
+              return;
+            }
             captureProxyLog();
             finish(
               reject,
-              new Error(status.playbackDiagnostic || 'Local remux failed'),
+              new Error(
+                Number(status.endOfStream ?? 0) === 1
+                  ? END_OF_STREAM_ERROR
+                  : status.playbackDiagnostic || 'Segment build failed',
+              ),
             );
+            return;
+          }
+          const inFlight = Number(status.generationInFlight ?? -1);
+          if (
+            Number(status.segmentDone ?? 0) === 1 &&
+            inFlight >= 0 &&
+            inFlight !== generation
+          ) {
+            // A newer seek/audio change replaced this build. It is not an
+            // error: the caller that requested it owns the outcome.
+            finish(reject, new Error('Segment build superseded'));
             return;
           }
           if (
@@ -545,8 +581,8 @@ export const App = () => {
             extractAudioTracks().length
           } retry=${prerollRetryRef.current}`,
         );
-        // The first timeout is treated as a pipeline hiccup: rebuild from the
-        // local master and remount once before showing any error to the user.
+        // The first timeout is treated as a pipeline hiccup: rebuild the
+        // segment and remount once before showing any error to the user.
         if (!prerollRetryRef.current && proxySessionRef.current) {
           prerollRetryRef.current = true;
           restartPlaybackAtRef.current(sourceBaseTimeRef.current, {});
@@ -618,7 +654,7 @@ export const App = () => {
       proxySessionRef.current = sessionId;
       lastProxySessionRef.current = sessionId;
       localUrlRef.current = result.localUrl;
-      pushNativeLog('proxy_master_started', `url=${result.localUrl}`);
+      pushNativeLog('segment_started', `url=${result.localUrl}`);
       return {sessionId, localUrl: result.localUrl};
     },
     [pushNativeLog],
@@ -656,10 +692,10 @@ export const App = () => {
     [sendAudioTracks, startPrerollWatchdog],
   );
 
-  const rebuildPlayback = useCallback(
+  /** Builds one segment without touching the mounted native player. */
+  const buildSegment = useCallback(
     async (
       sessionId: string,
-      localUrl: string,
       timeSec: number,
       generation: number,
       options: RebuildOptions,
@@ -680,6 +716,30 @@ export const App = () => {
       }
       const status = await waitForPlaybackReady(sessionId, generation);
       readAudioMetadata(status.audioTracks);
+      return status;
+    },
+    [readAudioMetadata, waitForPlaybackReady],
+  );
+
+  const nextGeneration = useCallback(
+    () => sourceGenerationRef.current + ++playbackGenerationRef.current + 1000,
+    [],
+  );
+
+  /** Builds a segment and immediately mounts it (seek, audio switch, retry). */
+  const rebuildPlayback = useCallback(
+    async (
+      sessionId: string,
+      localUrl: string,
+      timeSec: number,
+      generation: number,
+      options: RebuildOptions,
+    ) => {
+      await buildSegment(sessionId, timeSec, generation, options);
+      preparedNextRef.current = null;
+      nextPrepInFlightRef.current = false;
+      endOfStreamRef.current = false;
+      segmentEndSecRef.current = 0;
       sourceBaseTimeRef.current = Math.max(0, timeSec);
       if (options.notifySeeked) {
         pendingSeekSecRef.current = Math.max(0, timeSec);
@@ -692,8 +752,76 @@ export const App = () => {
         }`,
       );
     },
-    [mountPlaybackFile, pushNativeLog, readAudioMetadata, waitForPlaybackReady],
+    [buildSegment, mountPlaybackFile, pushNativeLog],
   );
+
+  /**
+   * Prepares the segment that continues the current one. It is built into the
+   * same cachePath, so the native rename unlinks the old inode while the old
+   * player is still reading it; we only remount after the real `ended` event.
+   */
+  const prepareNextSegment = useCallback(
+    async (startSec: number) => {
+      const sessionId = proxySessionRef.current;
+      if (!sessionId || nextPrepInFlightRef.current) {
+        return;
+      }
+      nextPrepInFlightRef.current = true;
+      const generation = nextGeneration();
+      pushNativeLog(
+        'next_segment_prep',
+        `start=${startSec.toFixed(2)} generation=${generation}`,
+      );
+      try {
+        await buildSegment(sessionId, startSec, generation, {});
+        preparedNextRef.current = {
+          localUrl: localUrlRef.current || videoUrl,
+          generation,
+          startSec,
+        };
+        pushNativeLog('next_segment_ready', `start=${startSec.toFixed(2)}`);
+      } catch (err: any) {
+        if (err?.message === END_OF_STREAM_ERROR) {
+          preparedNextRef.current = null;
+          endOfStreamRef.current = true;
+          pushNativeLog('next_segment_eof', `start=${startSec.toFixed(2)}`);
+        } else {
+          pushNativeLog(
+            'next_segment_failed',
+            err?.message || String(err || 'segment build failed'),
+          );
+        }
+      } finally {
+        nextPrepInFlightRef.current = false;
+      }
+    },
+    [buildSegment, nextGeneration, pushNativeLog, videoUrl],
+  );
+
+  const maybePrepareNext = useCallback(() => {
+    if (
+      endOfStreamRef.current ||
+      preparedNextRef.current ||
+      nextPrepInFlightRef.current ||
+      isSwitchingRef.current
+    ) {
+      return;
+    }
+    const duration = Number(videoRef.current?.duration ?? 0);
+    const current = Number(videoRef.current?.currentTime ?? 0);
+    if (
+      !Number.isFinite(duration) ||
+      !Number.isFinite(current) ||
+      duration <= 0 ||
+      duration - current > PREPARE_NEXT_AHEAD_SEC
+    ) {
+      return;
+    }
+    const startSec = sourceBaseTimeRef.current + duration;
+    if (startSec > 0) {
+      prepareNextSegment(startSec);
+    }
+  }, [prepareNextSegment]);
 
   const applyProxySource = useCallback(
     async (
@@ -705,6 +833,10 @@ export const App = () => {
       stopProxyPlayback(PROXY_RETIRE_DELAY_MS);
       proxyAudioMetadataRef.current = [];
       audioSignatureRef.current = '';
+      preparedNextRef.current = null;
+      nextPrepInFlightRef.current = false;
+      endOfStreamRef.current = false;
+      segmentEndSecRef.current = 0;
       const session = startProxySession(
         url,
         headers,
@@ -754,8 +886,10 @@ export const App = () => {
         pushNativeLog('rebuild_skipped', 'no active local session');
         return;
       }
-      const generation =
-        sourceGenerationRef.current + ++playbackGenerationRef.current + 1000;
+      const generation = nextGeneration();
+      preparedNextRef.current = null;
+      nextPrepInFlightRef.current = false;
+      endOfStreamRef.current = false;
       isSwitchingRef.current = true;
       prerollRetryRef.current = false;
       clearPrerollWatchdog();
@@ -783,6 +917,7 @@ export const App = () => {
     },
     [
       clearPrerollWatchdog,
+      nextGeneration,
       pushNativeLog,
       rebuildPlayback,
       reportedTime,
@@ -794,11 +929,11 @@ export const App = () => {
   restartPlaybackAtRef.current = restartPlaybackAt;
 
   /**
-   * The native file is complete before it is mounted, so `ended` is the real
-   * end of the movie. Ignore any early GStreamer EOS instead of leaving the
-   * player screen or showing an error over working video.
+   * `ended` normally means this bounded segment finished, not that the movie
+   * did. Advance to the segment prepared from the exact point where this one
+   * stopped. Only a clean EOF at that point is reported as the real end.
    */
-  const handleNativeEnded = useCallback(() => {
+  const handleNativeEnded = useCallback(async () => {
     const timeSec = reportedTime();
     const durationSec = reportedDuration();
     if (durationSec > 0 && timeSec < durationSec - 1) {
@@ -808,9 +943,63 @@ export const App = () => {
       );
       return;
     }
-    pushNativeLog('ended');
-    sendEventToWeb({name: 'ended'});
-  }, [pushNativeLog, reportedDuration, reportedTime, sendEventToWeb]);
+    const next = preparedNextRef.current;
+    if (next) {
+      preparedNextRef.current = null;
+      pushNativeLog(
+        'segment_boundary',
+        `start=${next.startSec.toFixed(2)} generation=${next.generation}`,
+      );
+      sourceBaseTimeRef.current = next.startSec;
+      segmentEndSecRef.current = 0;
+      mountPlaybackFile(next.localUrl);
+      return;
+    }
+    if (endOfStreamRef.current) {
+      pushNativeLog('ended');
+      sendEventToWeb({name: 'ended'});
+      return;
+    }
+    const sessionId = proxySessionRef.current;
+    const startSec = durationSec > 0 ? durationSec : timeSec;
+    if (!sessionId || startSec <= 0) {
+      pushNativeLog('ended');
+      sendEventToWeb({name: 'ended'});
+      return;
+    }
+    isSwitchingRef.current = true;
+    clearPrerollWatchdog();
+    pushNativeLog('segment_on_demand', `start=${startSec.toFixed(2)}`);
+    try {
+      await rebuildPlayback(
+        sessionId,
+        localUrlRef.current || videoUrl,
+        startSec,
+        nextGeneration(),
+        {},
+      );
+      isSwitchingRef.current = false;
+    } catch (err: any) {
+      isSwitchingRef.current = false;
+      const reason = err?.message || String(err || 'segment build failed');
+      pushNativeLog('segment_on_demand_failed', reason);
+      // The mounted file has already reached EOS, so staying silent would
+      // leave the UI stuck on a finished player. EOF and an unreachable
+      // source both end this playback session; neither shows an error screen.
+      pushNativeLog('ended');
+      sendEventToWeb({name: 'ended'});
+    }
+  }, [
+    clearPrerollWatchdog,
+    mountPlaybackFile,
+    nextGeneration,
+    pushNativeLog,
+    rebuildPlayback,
+    reportedDuration,
+    reportedTime,
+    sendEventToWeb,
+    videoUrl,
+  ]);
 
   const handleNativeMediaError = useCallback(
     (err: any) => {
@@ -828,8 +1017,8 @@ export const App = () => {
       captureProxyLog();
 
       // Decoder errors immediately after a rebuild are often a transient
-      // reconfiguration. Retry once from the local master before considering
-      // the playback broken.
+      // reconfiguration. Retry once from the network at the current position
+      // before considering the playback broken.
       const now = Date.now();
       if (
         (isSwitchingRef.current || now - lastMountAtRef.current < 2000) &&
@@ -921,6 +1110,10 @@ export const App = () => {
       pendingSeekSecRef.current = null;
       proxyAudioMetadataRef.current = [];
       audioSignatureRef.current = '';
+      preparedNextRef.current = null;
+      nextPrepInFlightRef.current = false;
+      endOfStreamRef.current = false;
+      segmentEndSecRef.current = 0;
       nativeLogsRef.current = [];
       proxyLogTailRef.current = '';
       playingRef.current = false;
@@ -1132,6 +1325,10 @@ export const App = () => {
             pendingSeekSecRef.current = null;
             proxyAudioMetadataRef.current = [];
             audioSignatureRef.current = '';
+            preparedNextRef.current = null;
+            nextPrepInFlightRef.current = false;
+            endOfStreamRef.current = false;
+            segmentEndSecRef.current = 0;
             nativeLogsRef.current = [];
             proxyLogTailRef.current = '';
             playingRef.current = false;
@@ -1221,6 +1418,10 @@ export const App = () => {
               hasPlayedOrCanPlayRef.current = true;
               clearPrerollWatchdog();
               nativeErrorCountRef.current = 0;
+              const duration = Number(videoRef.current?.duration ?? 0);
+              if (Number.isFinite(duration) && duration > 0) {
+                segmentEndSecRef.current = sourceBaseTimeRef.current + duration;
+              }
               pushNativeLog(
                 'canplay',
                 `dur=${videoRef.current?.duration ?? '-'}`,
@@ -1234,6 +1435,10 @@ export const App = () => {
               });
             }}
             onLoadedMetadata={() => {
+              const duration = Number(videoRef.current?.duration ?? 0);
+              if (Number.isFinite(duration) && duration > 0) {
+                segmentEndSecRef.current = sourceBaseTimeRef.current + duration;
+              }
               pushNativeLog(
                 'loadedmetadata',
                 `dur=${videoRef.current?.duration ?? '-'}`,
@@ -1295,6 +1500,7 @@ export const App = () => {
                 currentTime: reportedTime(),
                 duration: reportedDuration(),
               });
+              maybePrepareNext();
             }}
             onEnded={handleNativeEnded}
             onError={handleNativeMediaError}

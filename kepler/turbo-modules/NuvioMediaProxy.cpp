@@ -6,6 +6,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -65,6 +67,8 @@ struct ProxySession {
   bool ffmpegDone = false;
   int ffmpegExitCode = 0;
   std::string error;
+  /** JSON array of audio streams discovered from ffmpeg's input stream list. */
+  std::string audioTracksJson = "[]";
   std::mutex mutex;
   std::condition_variable cv;
   std::thread monitorThread;
@@ -329,6 +333,148 @@ std::string safeSessionId(const std::string& input) {
   return result.empty() ? std::string("session") : result;
 }
 
+struct AudioTrackMetadata {
+  int index = 0;
+  std::string language;
+  std::string title;
+  std::string sourceCodec;
+  std::string sourceChannels;
+  int sampleRate = 0;
+  bool isDefault = false;
+};
+
+std::string jsonEscape(const std::string& value) {
+  std::string result;
+  for (const unsigned char c : value) {
+    switch (c) {
+      case '"': result += "\\\""; break;
+      case '\\': result += "\\\\"; break;
+      case '\n': result += "\\n"; break;
+      case '\r': result += "\\r"; break;
+      case '\t': result += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buffer[7];
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+          result += buffer;
+        } else {
+          result.push_back(static_cast<char>(c));
+        }
+    }
+  }
+  return result;
+}
+
+/**
+ * ffmpeg lists every input stream before it writes a single frame. Reading that
+ * list lets the web UI show the real language/title of each audio track even
+ * when the native player only exposes anonymous AudioTrack objects.
+ */
+std::vector<AudioTrackMetadata> parseAudioTracks(const std::string& log) {
+  std::vector<AudioTrackMetadata> tracks;
+  std::vector<std::string> lines;
+  std::istringstream split(log);
+  std::string raw;
+  while (std::getline(split, raw)) {
+    lines.push_back(trim(raw));
+  }
+
+  int ordinal = 0;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const std::string& line = lines[i];
+    if (line.find("Stream mapping:") != std::string::npos) {
+      break;
+    }
+    const size_t marker = line.find("Stream #");
+    const size_t audio = line.find(": Audio:");
+    if (marker == std::string::npos || audio == std::string::npos || audio < marker) {
+      continue;
+    }
+
+    AudioTrackMetadata track;
+    track.index = ordinal++;
+    track.isDefault = line.find("(default)") != std::string::npos;
+
+    const std::string prefix = line.substr(marker + 8, audio - marker - 8);
+    const size_t lastColon = prefix.find_last_of(':');
+    const std::string spec =
+        lastColon == std::string::npos ? prefix : prefix.substr(lastColon + 1);
+    const size_t open = spec.find('(');
+    if (open != std::string::npos) {
+      const size_t close = spec.find(')', open + 1);
+      if (close != std::string::npos) {
+        track.language = trim(spec.substr(open + 1, close - open - 1));
+      }
+    }
+
+    const size_t detailsStart = audio + 8;
+    size_t detailsEnd = line.find(',', detailsStart);
+    if (detailsEnd == std::string::npos) {
+      detailsEnd = line.size();
+    }
+    track.sourceCodec = trim(line.substr(detailsStart, detailsEnd - detailsStart));
+    const std::string details = line.substr(detailsStart);
+
+    const size_t hz = details.find(" Hz");
+    if (hz != std::string::npos) {
+      size_t digitsStart = hz;
+      while (digitsStart > 0 && std::isdigit(static_cast<unsigned char>(details[digitsStart - 1]))) {
+        --digitsStart;
+      }
+      track.sampleRate = std::atoi(details.substr(digitsStart, hz - digitsStart).c_str());
+      const size_t channelsStart = details.find(", ", hz);
+      if (channelsStart != std::string::npos) {
+        const size_t channelsEnd = details.find(',', channelsStart + 2);
+        const size_t length =
+            channelsEnd == std::string::npos ? std::string::npos : channelsEnd - channelsStart - 2;
+        track.sourceChannels = trim(details.substr(channelsStart + 2, length));
+      }
+    }
+
+    for (size_t j = i + 1; j < lines.size(); ++j) {
+      const std::string& metaLine = lines[j];
+      if (metaLine.find("Stream #") != std::string::npos ||
+          metaLine.find("Stream mapping:") != std::string::npos) {
+        break;
+      }
+      const size_t separator = metaLine.find(':');
+      if (separator == std::string::npos) {
+        continue;
+      }
+      const std::string key = toLowerCopy(trim(metaLine.substr(0, separator)));
+      const std::string value = trim(metaLine.substr(separator + 1));
+      if (key == "title" && !value.empty()) {
+        track.title = value;
+      } else if (key == "language" && !value.empty()) {
+        track.language = value;
+      }
+    }
+    tracks.push_back(track);
+  }
+  return tracks;
+}
+
+std::string audioTracksToJson(const std::vector<AudioTrackMetadata>& tracks) {
+  std::ostringstream out;
+  out << '[';
+  for (size_t i = 0; i < tracks.size(); ++i) {
+    const AudioTrackMetadata& track = tracks[i];
+    if (i > 0) {
+      out << ',';
+    }
+    out << "{\"index\":" << track.index
+        << ",\"language\":\"" << jsonEscape(track.language) << '"'
+        << ",\"title\":\"" << jsonEscape(track.title) << '"'
+        << ",\"sourceCodec\":\"" << jsonEscape(track.sourceCodec) << '"'
+        << ",\"sourceChannels\":\"" << jsonEscape(track.sourceChannels) << '"'
+        << ",\"sampleRate\":" << track.sampleRate
+        << ",\"default\":" << (track.isDefault ? "true" : "false")
+        << '}';
+  }
+  out << ']';
+  return out.str();
+}
+
 long long fileSize(const std::string& path) {
   struct stat info {};
   if (stat(path.c_str(), &info) != 0) {
@@ -442,8 +588,10 @@ void monitorProcess(const std::shared_ptr<ProxySession>& session) {
  */
 std::vector<std::string> buildCommand(const std::shared_ptr<ProxySession>& session) {
   const std::string binary = bundledPath(FFMPEG_BINARY);
+  // Info level is needed once: ffmpeg prints the input stream languages/titles
+  // before remuxing. -nostats keeps that diagnostic log free of progress spam.
   std::vector<std::string> argv = {
-      binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"};
+      binary, "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-y"};
   if (!session->headers.empty()) {
     argv.push_back("-headers");
     argv.push_back(session->headers);
@@ -654,6 +802,8 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
 
   {
     std::lock_guard<std::mutex> lock(session->mutex);
+    session->audioTracksJson =
+        audioTracksToJson(parseAudioTracks(readTail(session->logPath, LOG_TAIL_BYTES)));
     session->ready = true;
     session->localUrl = "file://" + session->cachePath;
   }
@@ -665,6 +815,7 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   result["localUrl"] = session->localUrl;
   result["cachePath"] = session->cachePath;
   result["logPath"] = session->logPath;
+  result["audioTracks"] = session->audioTracksJson;
   return result;
 }
 
@@ -692,6 +843,7 @@ JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
   result["exitCode"] = 0.0;
   result["error"] = std::string("");
   result["log"] = std::string("");
+  result["audioTracks"] = std::string("[]");
   {
     std::ifstream report(SELF_TEST_PATH);
     if (report) {
@@ -715,6 +867,7 @@ JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
   result["bytesWritten"] = static_cast<double>(std::max<long long>(fileSize(session->cachePath), 0));
   result["exitCode"] = static_cast<double>(session->ffmpegExitCode);
   result["log"] = trim(readTail(session->logPath, LOG_TAIL_BYTES));
+  result["audioTracks"] = session->audioTracksJson;
   // Rebuild the message when the monitor observed the exit before ffmpeg had
   // flushed its last diagnostic line, so errors always carry the real reason.
   if (session->ffmpegDone && session->ffmpegExitCode != 0 && session->error.empty()) {

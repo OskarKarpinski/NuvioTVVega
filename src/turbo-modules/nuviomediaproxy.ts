@@ -19,6 +19,8 @@ export type MediaProxyResult = {
   localUrl: string;
   cachePath: string;
   logPath: string;
+  /** JSON array of audio streams discovered by the remuxer, with titles/languages. */
+  audioTracks?: string;
   error?: string;
 };
 
@@ -28,6 +30,8 @@ export type MediaProxyStatus = {
   exitCode: number;
   error: string;
   log: string;
+  /** JSON array of audio streams discovered by the remuxer, with titles/languages. */
+  audioTracks?: string;
   selfTest?: string;
 };
 

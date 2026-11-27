@@ -792,12 +792,14 @@ void handleClient(const std::shared_ptr<ProxySession>& session, int fd) {
   }
 
   std::ostringstream header;
-  header << "HTTP/1.1 206 Partial Content\r\n"
+  header << (hasRange ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n")
          << "Content-Type: video/x-matroska\r\n"
          << "Accept-Ranges: bytes\r\n"
-         << "Cache-Control: no-store\r\n"
-         << "Content-Range: bytes " << start << "-" << actualEnd << "/" << total << "\r\n"
-         << "Content-Length: " << (actualEnd - start + 1) << "\r\n"
+         << "Cache-Control: no-store\r\n";
+  if (hasRange) {
+    header << "Content-Range: bytes " << start << "-" << actualEnd << "/" << total << "\r\n";
+  }
+  header << "Content-Length: " << (actualEnd - start + 1) << "\r\n"
          << "Connection: close\r\n\r\n";
   const std::string headerText = header.str();
   sendAll(fd, headerText.data(), headerText.size());

@@ -4,7 +4,7 @@ import {TurboModuleRegistry} from '@amazon-devices/keplerscript-turbomodule-api'
 export type MediaProxyConfig = {
   sessionId: string;
   url: string;
-  /** HTTP headers formatted as "Key: Value\r\n" pairs. */
+  /** HTTP headers formatted as "Key: Value\n" pairs (LF terminator on Vega). */
   headers: string;
   /** Optional source size hint in bytes; ffprobe's value takes precedence. */
   totalBytes: number;

@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -24,6 +25,7 @@
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace nuviomediaproxyTurboModule {
@@ -105,21 +107,42 @@ std::vector<char*> argvPointers(std::vector<std::string>& argv) {
   return pointers;
 }
 
-bool runCapture(const std::vector<std::string>& argv, std::string& output, size_t maxBytes) {
-  int pipefd[2];
-  if (pipe(pipefd) != 0) {
-    return false;
+/**
+ * Runs a child process and captures both streams. ffprobe writes its real
+ * failure reason (HTTP status, protocol error, etc.) to stderr, so hiding it
+ * would leave the app with only "ffprobe failed for media source".
+ */
+int runCapture(
+    const std::vector<std::string>& argv,
+    std::string& output,
+    std::string& errorOutput,
+    size_t maxBytes) {
+  int outPipe[2] = {-1, -1};
+  int errPipe[2] = {-1, -1};
+  if (pipe(outPipe) != 0) {
+    return -1;
   }
+  if (pipe(errPipe) != 0) {
+    close(outPipe[0]);
+    close(outPipe[1]);
+    return -1;
+  }
+
   const pid_t pid = fork();
   if (pid < 0) {
-    close(pipefd[0]);
-    close(pipefd[1]);
-    return false;
+    close(outPipe[0]);
+    close(outPipe[1]);
+    close(errPipe[0]);
+    close(errPipe[1]);
+    return -1;
   }
   if (pid == 0) {
-    close(pipefd[0]);
-    dup2(pipefd[1], STDOUT_FILENO);
-    close(pipefd[1]);
+    close(outPipe[0]);
+    close(errPipe[0]);
+    dup2(outPipe[1], STDOUT_FILENO);
+    dup2(errPipe[1], STDERR_FILENO);
+    close(outPipe[1]);
+    close(errPipe[1]);
     int devNull = open("/dev/null", O_RDONLY);
     if (devNull >= 0) {
       dup2(devNull, STDIN_FILENO);
@@ -129,22 +152,58 @@ bool runCapture(const std::vector<std::string>& argv, std::string& output, size_
     execvp(pointers[0], pointers.data());
     _exit(127);
   }
-  close(pipefd[1]);
+
+  close(outPipe[1]);
+  close(errPipe[1]);
+  struct pollfd fds[2] = {
+      {outPipe[0], POLLIN, 0},
+      {errPipe[0], POLLIN, 0},
+  };
   char buffer[4096];
-  while (output.size() < maxBytes) {
-    const ssize_t count = read(
-        pipefd[0], buffer,
-        std::min<size_t>(sizeof(buffer), maxBytes - output.size()));
-    if (count <= 0) {
+  while (fds[0].fd >= 0 || fds[1].fd >= 0) {
+    const int ready = poll(fds, 2, -1);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
       break;
     }
-    output.append(buffer, static_cast<size_t>(count));
+    for (size_t index = 0; index < 2; ++index) {
+      if (fds[index].fd < 0 ||
+          (fds[index].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+        continue;
+      }
+      const ssize_t count = read(fds[index].fd, buffer, sizeof(buffer));
+      if (count > 0) {
+        std::string& sink = index == 0 ? output : errorOutput;
+        if (sink.size() < maxBytes) {
+          sink.append(buffer, std::min<size_t>(static_cast<size_t>(count), maxBytes - sink.size()));
+        }
+      } else if (count == 0 || errno != EINTR) {
+        close(fds[index].fd);
+        fds[index].fd = -1;
+      }
+    }
   }
-  close(pipefd[0]);
+
   int status = 0;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
   }
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+std::string normalizeHeaderBlock(const std::string& headers) {
+  std::string normalized;
+  normalized.reserve(headers.size());
+  for (size_t index = 0; index < headers.size(); ++index) {
+    if (headers[index] == '\r' && index + 1 < headers.size() && headers[index + 1] == '\n') {
+      normalized.push_back('\n');
+      ++index;
+    } else {
+      normalized.push_back(headers[index]);
+    }
+  }
+  return normalized;
 }
 
 std::string trim(const std::string& input) {
@@ -208,8 +267,17 @@ void selectTracks(
   probeArgv.push_back(url);
 
   std::string output;
-  if (!runCapture(probeArgv, output, 256 * 1024)) {
-    error = "ffprobe failed for media source";
+  std::string errorOutput;
+  const int probeExit = runCapture(probeArgv, output, errorOutput, 256 * 1024);
+  if (probeExit != 0) {
+    std::string detail = trim(errorOutput.empty() ? output : errorOutput);
+    if (detail.size() > 512) {
+      detail = detail.substr(0, 512);
+    }
+    error = "ffprobe failed for media source (exit " + std::to_string(probeExit) + ")";
+    if (!detail.empty()) {
+      error += ": " + detail;
+    }
     return;
   }
 
@@ -240,9 +308,13 @@ void selectTracks(
     try {
       index = std::stoi(trim(first));
     } catch (...) {
-      // Format section: bit_rate,size.
-      formatBitrate = parseBitrate(first);
-      sourceBytes = parseBitrate(second);
+      // Vega's ffprobe prints the format section as size,bit_rate. Guard against
+      // a reversed order on other builds by comparing magnitudes.
+      sourceBytes = parseBitrate(first);
+      formatBitrate = parseBitrate(second);
+      if (formatBitrate > sourceBytes) {
+        std::swap(sourceBytes, formatBitrate);
+      }
       continue;
     }
     const std::string codec = trim(second);
@@ -670,7 +742,7 @@ NuvioMediaProxy::~NuvioMediaProxy() noexcept {
 JSObject NuvioMediaProxy::startProxy(JSObject config) {
   const std::string sessionId = valueOr<std::string>(config, "sessionId", "");
   const std::string url = valueOr<std::string>(config, "url", "");
-  const std::string headers = valueOr<std::string>(config, "headers", "");
+  const std::string headers = normalizeHeaderBlock(valueOr<std::string>(config, "headers", ""));
   const double sourceTotalBytes = valueOr<double>(config, "totalBytes", 0);
   const double startTimeSec = valueOr<double>(config, "startTimeSec", 0);
   const double maxDiskBytesValue =

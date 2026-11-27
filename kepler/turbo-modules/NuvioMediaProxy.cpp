@@ -9,8 +9,10 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
+#include <iterator>
 #include <linux/falloc.h>
 #include <map>
 #include <memory>
@@ -114,12 +116,75 @@ std::vector<char*> argvPointers(std::vector<std::string>& argv) {
 }
 
 /**
- * The Kepler app process exports an LD_LIBRARY_PATH pointing at its private
- * libraries. System ffmpeg/ffprobe must not inherit it: on Vega that makes the
- * loader pick an incompatible libavutil and ffprobe dies with
- * `undefined symbol: av_hash_alloc, version LIBAVUTIL_56`.
+ * Kepler apps run in their own mount namespace. `/usr/lib` inside that
+ * namespace contains the app's incompatible libav* build, so the system
+ * ffprobe binary cannot resolve `av_hash_alloc, version LIBAVUTIL_56`. We ship
+ * the matching libav* files next to this module and point the child at them.
  */
-std::vector<std::string> sanitizedEnvironment() {
+std::string moduleDirectory() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&moduleDirectory), &info) != 0 && info.dli_fname != nullptr) {
+    const std::string path = info.dli_fname;
+    const auto slash = path.find_last_of('/');
+    if (slash != std::string::npos) {
+      return path.substr(0, slash);
+    }
+  }
+  // dladdr can fail when the module was loaded from a generated link map.
+  // Fall back to the mapping recorded by the kernel for this process.
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  while (std::getline(maps, line)) {
+    const auto at = line.find("libNuvioMediaProxy.so");
+    if (at == std::string::npos) {
+      continue;
+    }
+    const auto space = line.find_first_of(" \t", at);
+    if (space != std::string::npos) {
+      const std::string path = line.substr(at, space - at);
+      const auto slash = path.find_last_of('/');
+      if (slash != std::string::npos) {
+        return path.substr(0, slash);
+      }
+    }
+  }
+  return std::string("/usr/lib");
+}
+
+bool directoryHasLibavutil(const std::string& directory) {
+  const std::string path = directory + "/libavutil.so.56";
+  if (access(path.c_str(), R_OK) != 0) {
+    return false;
+  }
+  // The app's own libavutil has a different ABI. Verify the exported symbol is
+  // really there instead of trusting the SONAME alone.
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  const std::string content{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+  return content.find("av_hash_alloc") != std::string::npos;
+}
+
+std::string libraryDirectory() {
+  const std::string module = moduleDirectory();
+  const std::vector<std::string> candidates = {
+      module,
+      module + "/lib",
+      module + "/../lib/armv7",
+      "/opt/apps/com.nuvio.tv.vega/lib/armv7",
+      "/tmp/nuvio-libs",
+      "/usr/lib",
+  };
+  for (const auto& candidate : candidates) {
+    if (directoryHasLibavutil(candidate)) {
+      return candidate;
+    }
+  }
+  return module;
+}
+
+std::vector<std::string> sanitizedEnvironment(const std::string& libraryDirectory) {
   std::vector<std::string> environment;
   bool hasPath = false;
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
@@ -138,13 +203,30 @@ std::vector<std::string> sanitizedEnvironment() {
   if (!hasPath) {
     environment.push_back("PATH=/usr/bin:/bin");
   }
-  environment.push_back("LD_LIBRARY_PATH=/usr/lib:/lib");
+  environment.push_back("LD_LIBRARY_PATH=" + libraryDirectory + ":/usr/lib:/lib");
   return environment;
 }
 
 void execChild(const std::vector<std::string>& argv) {
-  auto pointers = argvPointers(const_cast<std::vector<std::string>&>(argv));
-  auto environment = sanitizedEnvironment();
+  const std::string libraries = libraryDirectory();
+  const std::string diagnostic =
+      "[proxy-env] module=" + moduleDirectory() + " libs=" + libraries + "\n";
+  write(STDERR_FILENO, diagnostic.data(), diagnostic.size());
+
+  // Kepler launches apps in secure mode, so the dynamic linker can ignore
+  // LD_LIBRARY_PATH for children. Invoke the loader with an explicit
+  // --library-path, which is honoured regardless of AT_SECURE.
+  constexpr const char* LOADER = "/lib/ld-linux-armhf.so.3";
+  std::vector<std::string> command;
+  if (access(LOADER, X_OK) == 0) {
+    command.push_back(LOADER);
+    command.push_back("--library-path");
+    command.push_back(libraries + ":/usr/lib:/lib");
+  }
+  command.insert(command.end(), argv.begin(), argv.end());
+
+  auto pointers = argvPointers(command);
+  auto environment = sanitizedEnvironment(libraries);
   std::vector<char*> environmentPointers;
   environmentPointers.reserve(environment.size() + 1);
   for (auto& item : environment) {
@@ -354,6 +436,18 @@ void selectTracks(
     std::getline(fields, third, ',');
     std::getline(fields, fourth, ',');
 
+    if (trim(third).empty() && trim(fourth).empty()) {
+      // Vega's ffprobe prints `format` as `size,bit_rate`, not as a stream row.
+      // A 2 GB file still fits in an int, so stoi() would silently accept it as
+      // a bogus stream index unless the row shape is checked first.
+      sourceBytes = parseBitrate(first);
+      formatBitrate = parseBitrate(second);
+      if (formatBitrate > sourceBytes) {
+        std::swap(sourceBytes, formatBitrate);
+      }
+      continue;
+    }
+
     int index = -1;
     try {
       index = std::stoi(trim(first));
@@ -397,9 +491,11 @@ void selectTracks(
       ? allVideoBitrate + allAudioBitrate
       : formatBitrate;
   const double effectiveSourceBytes = sourceBytes > 0 ? sourceBytes : sourceTotalBytes;
-  if (effectiveSourceBytes > 0 && totalBitrate > 0 && selectedBitrate > 0) {
-    double estimate = effectiveSourceBytes * selectedBitrate / totalBitrate;
-    estimate = std::min(estimate, effectiveSourceBytes);
+  if (effectiveSourceBytes > 0) {
+    double estimate = effectiveSourceBytes;
+    if (totalBitrate > 0 && selectedBitrate > 0) {
+      estimate = std::min(estimate, effectiveSourceBytes * selectedBitrate / totalBitrate);
+    }
     if (estimate > 0) {
       estimatedTotalBytes = estimate;
     }
@@ -662,8 +758,21 @@ void handleClient(const std::shared_ptr<ProxySession>& session, int fd) {
     }
     start = 0;
     end = std::max<long long>(fileSize(session->cachePath) - 1, 0);
-  } else if (end < 0 || end >= total) {
-    end = total - 1;
+  } else {
+    if (end < 0 || end >= total) {
+      end = total - 1;
+    }
+    // An open-ended request must not block until the whole (multi-GB) remux is
+    // written. Serve the bytes that exist now; the player will ask for more as
+    // it consumes the stream.
+    const long long availableNow = fileSize(session->cachePath);
+    if (end >= availableNow) {
+      if (availableNow <= 0 && !waitForBytes(session, 1)) {
+        close(fd);
+        return;
+      }
+      end = std::min(end, fileSize(session->cachePath) - 1);
+    }
   }
 
   if (!waitForBytes(session, std::min(end + 1, total))) {
@@ -774,7 +883,18 @@ void serverLoop(const std::shared_ptr<ProxySession>& session) {
 
 } // namespace
 
-NuvioMediaProxy::NuvioMediaProxy() = default;
+NuvioMediaProxy::NuvioMediaProxy() {
+  // Self-check at module load: the child process must be able to resolve the
+  // bundled FFmpeg libraries. The report is written to /tmp so it can be read
+  // back from the device without having to start playback.
+  std::string output;
+  std::string errorOutput;
+  const int code = runCapture({FFPROBE_BIN, "-version"}, output, errorOutput, 8192);
+  std::ofstream report("/tmp/nuvio-selftest.log", std::ios::trunc);
+  report << "code=" << code << "\n"
+         << "output=" << output.substr(0, 512) << "\n"
+         << "error=" << errorOutput.substr(0, 2048) << "\n";
+}
 
 NuvioMediaProxy::~NuvioMediaProxy() noexcept {
   std::vector<std::string> ids;
@@ -885,6 +1005,10 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   ffmpegArgv.push_back("copy");
   ffmpegArgv.push_back("-c:s");
   ffmpegArgv.push_back("copy");
+  // No SeekHead/Cues pointing at the end of a still-growing file: the native
+  // player would request those byte ranges before preroll and give up.
+  ffmpegArgv.push_back("-write_index");
+  ffmpegArgv.push_back("0");
   ffmpegArgv.push_back("-f");
   ffmpegArgv.push_back("matroska");
   ffmpegArgv.push_back("pipe:1");
@@ -993,6 +1117,15 @@ JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
   result["exitCode"] = 0.0;
   result["error"] = std::string("");
   result["needsRestart"] = false;
+  {
+    std::ifstream report("/tmp/nuvio-selftest.log");
+    if (report) {
+      result["selfTest"] = std::string{std::istreambuf_iterator<char>(report),
+                                       std::istreambuf_iterator<char>()};
+    } else {
+      result["selfTest"] = std::string("missing");
+    }
+  }
   std::shared_ptr<ProxySession> session;
   {
     std::lock_guard<std::mutex> lock(gSessionsMutex);

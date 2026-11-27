@@ -32,6 +32,7 @@ export type MediaProxyStatus = {
   exitCode: number;
   error: string;
   needsRestart: boolean;
+  selfTest?: string;
 };
 
 export interface NuvioMediaProxy extends KeplerTurboModule {

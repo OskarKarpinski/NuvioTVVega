@@ -819,6 +819,17 @@ export const App = () => {
   );
 
   React.useEffect(() => {
+    try {
+      const diagnostic = NuvioMediaProxy.proxyStatus('__diagnostic__') as {
+        selfTest?: string;
+      };
+      console.log('[Vega][selftest]', diagnostic?.selfTest ?? 'missing');
+    } catch (e) {
+      console.warn('[Vega][selftest] unavailable', e);
+    }
+  }, []);
+
+  React.useEffect(() => {
     if (sourcePendingToken > 0) {
       prepareSource();
     }

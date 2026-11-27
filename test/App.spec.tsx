@@ -1,6 +1,7 @@
 import * as React from 'react';
 import {act, render, waitFor} from '@testing-library/react-native';
 import {App, isMainWebviewDocument} from '../src/App';
+import NuvioMediaProxy from '../src/turbo-modules/nuviomediaproxy';
 
 jest.mock('@amazon-devices/webview', () => ({
   WebView: 'WebView',
@@ -15,20 +16,16 @@ jest.mock('../src/turbo-modules/nuviomediaproxy', () => ({
   default: {
     startProxy: jest.fn(() => ({
       localUrl: 'file:///tmp/nuvio-proxy-test.mkv',
-      port: 12345,
       cachePath: '/tmp/nuvio-proxy-test.mkv',
       logPath: '/tmp/nuvio-proxy-test.log',
-      sourceBytes: 0,
     })),
     stopProxy: jest.fn(() => true),
     proxyStatus: jest.fn(() => ({
       state: 'streaming',
       bytesWritten: 0,
-      diskBytes: 0,
-      punchedBytes: 0,
       exitCode: 0,
       error: '',
-      needsRestart: false,
+      log: '',
     })),
     readProxyLog: jest.fn(() => ''),
   },
@@ -72,6 +69,46 @@ describe('App', () => {
     await waitFor(() => {
       const video = UNSAFE_getByType('Video' as any);
       expect(String(video.props.src)).toBe('file:///tmp/nuvio-proxy-test.mkv');
+    });
+  });
+
+  it('rebuilds the local file with the selected audio track as default', async () => {
+    const startProxy = NuvioMediaProxy.startProxy as jest.Mock;
+    startProxy.mockClear();
+    const {UNSAFE_getByType} = render(<App />);
+    const webView = UNSAFE_getByType('WebView' as any);
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'open',
+            url: 'https://example.test/video.mkv',
+            headers: null,
+          }),
+        },
+      });
+    });
+    await waitFor(() => expect(startProxy).toHaveBeenCalled());
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'selectAudioTrack',
+            index: 1,
+            trackCount: 2,
+          }),
+        },
+      });
+    });
+
+    await waitFor(() => {
+      const lastCall = startProxy.mock.calls[startProxy.mock.calls.length - 1][0];
+      expect(lastCall.audioTrackIndex).toBe(1);
+      expect(lastCall.audioTrackCount).toBe(2);
     });
   });
 

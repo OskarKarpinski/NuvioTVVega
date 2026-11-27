@@ -6,36 +6,29 @@ export type MediaProxyConfig = {
   url: string;
   /** HTTP headers formatted as "Key: Value\n" pairs (LF terminator on Vega). */
   headers: string;
-  /** Optional source size hint in bytes; ffprobe's value takes precedence. */
-  totalBytes: number;
-  /** Start time in seconds; used for seeks without keeping old cache data. */
+  /** Start time in seconds; used for seeks by restarting the remux. */
   startTimeSec: number;
-  /** Hard limit for actually occupied disk space (holes are reclaimed). */
-  maxDiskBytes: number;
+  /** Output audio stream to mark as default; -1 keeps the source order. */
+  audioTrackIndex?: number;
+  /** Number of audio streams exposed by the native player, for dispositions. */
+  audioTrackCount?: number;
 };
 
 export type MediaProxyResult = {
+  /** file:// URI of the locally remuxed MKV, the only src given to <Video>. */
   localUrl: string;
-  port: number;
   cachePath: string;
   logPath: string;
-  /** Source size reported by ffprobe, used to estimate the remuxed output. */
-  sourceBytes: number;
   error?: string;
 };
 
 export type MediaProxyStatus = {
   state: string;
   bytesWritten: number;
-  diskBytes: number;
-  punchedBytes: number;
   exitCode: number;
   error: string;
-  needsRestart: boolean;
+  log: string;
   selfTest?: string;
-  clientRequests?: number;
-  clientBytesSent?: number;
-  lastClientRange?: string;
 };
 
 export interface NuvioMediaProxy extends KeplerTurboModule {

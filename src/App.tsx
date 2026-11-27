@@ -55,7 +55,6 @@ const {width: WINDOW_WIDTH, height: WINDOW_HEIGHT} = Dimensions.get('window');
 
 const NATIVE_PREROLL_TIMEOUT_MS = 15000;
 const MAX_NATIVE_LOGS = 40;
-const PROXY_MAX_DISK_BYTES = 768 * 1024 * 1024;
 const MAX_PROXY_LOG_CHARS = 8000;
 const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
 
@@ -82,19 +81,27 @@ export const App = () => {
   const [playbackKey, setPlaybackKey] = useState<number>(0);
   const customHeadersRef = useRef<Record<string, string> | null>(null);
 
-  // Every source is routed through the on-device proxy. The native player only
-  // ever sees http://127.0.0.1:<port>/stream.mkv, never the remote URL.
+  // Every source is routed through the on-device remuxer. The native player
+  // only ever sees a local file:// URI, never the remote URL or its headers.
   const proxySessionRef = useRef<string | null>(null);
   const lastProxySessionRef = useRef<string | null>(null);
   const proxyPollRef = useRef<any>(null);
   const proxyLogTailRef = useRef<string>('');
   const restartProxyAtRef = useRef<
-    (timeSec: number, headersOverride?: Record<string, string> | null, notifySeeked?: boolean) => Promise<void>
+    (
+      timeSec: number,
+      headersOverride?: Record<string, string> | null,
+      notifySeeked?: boolean,
+      audioTrackIndex?: number,
+    ) => Promise<void>
   >(async () => {});
 
   const sourceUrlRef = useRef<string>('');
   const sourceHeadersRef = useRef<Record<string, string> | null>(null);
-  const sourceTotalBytesRef = useRef<number>(0);
+  // Audio selection is applied by the remuxer, not by trusting the native
+  // player's track enable API: it is authoritative for every source and codec.
+  const selectedAudioTrackRef = useRef<number>(-1);
+  const audioTrackCountRef = useRef<number>(0);
   // ffmpeg starts each remux at time 0, so positions reported to the web UI
   // must be offset by the requested source start time.
   const sourceBaseTimeRef = useRef<number>(0);
@@ -192,7 +199,7 @@ export const App = () => {
     }
   }, []);
 
-  const extractAudioTracks = useCallback(() => {
+  const extractAudioTracks = useCallback((selectedIndex?: number) => {
     const tracks: Array<{index: number; id: string; kind: string; label: string; language: string; enabled: boolean}> = [];
     try {
       const list = videoRef.current?.audioTracks;
@@ -200,13 +207,17 @@ export const App = () => {
         for (let i = 0; i < list.length; i++) {
           const item = list[i];
           if (item) {
+            const enabled =
+              typeof selectedIndex === 'number' && selectedIndex >= 0
+                ? i === selectedIndex
+                : Boolean(item.enabled);
             tracks.push({
               index: i,
               id: item.id || String(i),
               kind: item.kind || 'main',
               label: item.label || item.language || '',
               language: item.language || 'und',
-              enabled: Boolean(item.enabled),
+              enabled,
             });
           }
         }
@@ -350,41 +361,35 @@ export const App = () => {
     async (
       url: string,
       headers: Record<string, string> | null,
-      totalBytes: number,
       startTimeSec: number,
       generation: number,
+      audioTrackIndex: number,
+      audioTrackCount: number,
     ) => {
       const sessionId = `nuvio-${Date.now()}-${generation}-${Math.random()
         .toString(36)
         .slice(2, 8)}`;
       pushNativeLog(
         'proxy_start',
-        `time=${startTimeSec.toFixed(1)} total=${totalBytes} headers=${Object.keys(headers || {}).join(',')}`,
+        `time=${startTimeSec.toFixed(1)} headers=${Object.keys(headers || {}).join(',')} audio=${audioTrackIndex}/${audioTrackCount}`,
       );
       const result = NuvioMediaProxy.startProxy({
         sessionId,
         url,
         headers: formatProxyHeaders(headers),
-        totalBytes,
         startTimeSec,
-        maxDiskBytes: PROXY_MAX_DISK_BYTES,
+        audioTrackIndex,
+        audioTrackCount,
       });
       if (result?.error || !result?.localUrl) {
-        throw new Error(result?.error || 'Proxy did not return a local URL');
+        throw new Error(result?.error || 'Remuxer did not return a local URL');
       }
       if (generation !== sourceGenerationRef.current) {
         NuvioMediaProxy.stopProxy(sessionId);
         return null;
       }
-      pushNativeLog(
-        'proxy_ready',
-        `url=${result.localUrl} path=${result.cachePath} source=${result.sourceBytes ?? 0}`,
-      );
-      return {
-        sessionId,
-        localUrl: result.localUrl,
-        sourceBytes: Number(result.sourceBytes ?? 0),
-      };
+      pushNativeLog('proxy_ready', `url=${result.localUrl} path=${result.cachePath}`);
+      return {sessionId, localUrl: result.localUrl};
     },
     [pushNativeLog],
   );
@@ -399,25 +404,39 @@ export const App = () => {
         }
         try {
           const status = NuvioMediaProxy.proxyStatus(sessionId);
-          if (status?.needsRestart) {
-            stopProxyPolling();
-            clearPrerollWatchdog();
-            restartProxyAtRef.current(reportedTime());
-            return;
-          }
+          const exitCode = Number(status?.exitCode ?? 0);
           const failed =
             Boolean(status?.error) ||
-            (status?.state === 'complete' && Number(status?.exitCode ?? 0) !== 0);
+            (status?.state === 'complete' && exitCode !== 0);
           if (failed) {
             stopProxyPolling();
             clearPrerollWatchdog();
             captureProxyLog();
+            if (hasPlayedOrCanPlayRef.current) {
+              // Once frames and audio have reached the native player, an ffmpeg
+              // exit is a diagnostic event, not a playback failure. The local
+              // file stays mounted; killing it here produced a false error
+              // screen over working video.
+              pushNativeLog(
+                'proxy_finished',
+                `exit=${exitCode} ${status?.error || 'remux ended'}`,
+              );
+              if (status?.log) {
+                pushNativeLog('proxy_log', status.log.slice(-600).replace(/\s+/g, ' '));
+              }
+              return;
+            }
             stopProxyPlayback();
-            forwardNativeError('proxy-stream-failed', status?.error || `Proxy stream failed (exit ${status?.exitCode ?? 'unknown'})`, 4, {
-              url,
-              diskBytes: status?.diskBytes ?? 0,
-              exitCode: status?.exitCode ?? 0,
-            });
+            forwardNativeError(
+              'proxy-stream-failed',
+              status?.error || `Remux failed (exit ${exitCode || 'unknown'})`,
+              4,
+              {
+                url,
+                exitCode,
+                proxyLog: status?.log || '',
+              },
+            );
           }
         } catch (err: any) {
           console.warn('[VegaPlayer] proxyStatus failed:', err);
@@ -428,7 +447,7 @@ export const App = () => {
       captureProxyLog,
       clearPrerollWatchdog,
       forwardNativeError,
-      reportedTime,
+      pushNativeLog,
       stopProxyPlayback,
       stopProxyPolling,
     ],
@@ -438,12 +457,28 @@ export const App = () => {
     async (
       url: string,
       headers: Record<string, string> | null,
-      totalBytes: number,
       startTimeSec: number,
       generation: number,
+      audioTrackIndex?: number,
+      audioTrackCount?: number,
     ) => {
       stopProxyPlayback();
-      const session = await startProxySession(url, headers, totalBytes, startTimeSec, generation);
+      const trackIndex =
+        typeof audioTrackIndex === 'number' && audioTrackIndex >= 0
+          ? audioTrackIndex
+          : selectedAudioTrackRef.current;
+      const trackCount =
+        typeof audioTrackCount === 'number' && audioTrackCount > 0
+          ? audioTrackCount
+          : audioTrackCountRef.current;
+      const session = await startProxySession(
+        url,
+        headers,
+        startTimeSec,
+        generation,
+        trackIndex,
+        trackCount,
+      );
       if (!session || generation !== sourceGenerationRef.current) {
         return;
       }
@@ -452,11 +487,10 @@ export const App = () => {
       sourceBaseTimeRef.current = startTimeSec;
       sourceUrlRef.current = url;
       sourceHeadersRef.current = headers;
-      sourceTotalBytesRef.current = session.sourceBytes || totalBytes;
       hasPlayedOrCanPlayRef.current = false;
       targetLocalSecRef.current = 0;
-      // Mount the native player directly on the proxy URL. It must never see
-      // the remote URL, not even for a single frame while ffprobe runs.
+      // Mount the native player directly on the local URL. It must never see
+      // the remote URL, not even for a single frame while ffmpeg runs.
       setPlaybackKey(prev => prev + 1);
       setVideoUrl(session.localUrl);
       startPrerollWatchdog(session.localUrl);
@@ -470,6 +504,8 @@ export const App = () => {
       timeSec: number,
       headersOverride?: Record<string, string> | null,
       notifySeeked: boolean = false,
+      audioTrackIndex?: number,
+      audioTrackCount?: number,
     ) => {
       const url = sourceUrlRef.current;
       if (!url) {
@@ -483,9 +519,10 @@ export const App = () => {
         await applyProxySource(
           url,
           headers,
-          sourceTotalBytesRef.current,
           Math.max(0, timeSec),
           generation,
+          audioTrackIndex,
+          audioTrackCount,
         );
         if (notifySeeked && generation === sourceGenerationRef.current) {
           sendEventToWeb({name: 'seeked', currentTime: timeSec});
@@ -516,8 +553,8 @@ export const App = () => {
     }
     preparingSourceRef.current = true;
     try {
-      pushNativeLog('source_probe', 'proxy owns ffprobe/ffmpeg; no direct source probe');
-      await applyProxySource(url, headers, 0, 0, generation);
+      pushNativeLog('source_probe', 'bundled ffmpeg remuxes the source locally');
+      await applyProxySource(url, headers, 0, generation);
     } catch (err: any) {
       if (generation !== sourceGenerationRef.current) {
         return;
@@ -560,7 +597,8 @@ export const App = () => {
       sourceUrlRef.current = url;
       sourceHeadersRef.current = headers;
       sourceBaseTimeRef.current = 0;
-      sourceTotalBytesRef.current = 0;
+      selectedAudioTrackRef.current = -1;
+      audioTrackCountRef.current = 0;
       pendingSourceRef.current = {
         url,
         headers,
@@ -709,21 +747,48 @@ export const App = () => {
               break;
             }
             case 'selectAudioTrack':
-              if (videoRef.current?.audioTracks && typeof payload.index === 'number') {
+              if (
+                typeof payload.index === 'number' &&
+                Number.isFinite(payload.index) &&
+                payload.index >= 0
+              ) {
+                const index = Math.floor(payload.index);
+                const trackCount =
+                  Number(payload.trackCount) > 0
+                    ? Math.floor(payload.trackCount)
+                    : audioTrackCountRef.current ||
+                      Number(videoRef.current?.audioTracks?.length || 0);
+                if (index === selectedAudioTrackRef.current && proxySessionRef.current) {
+                  break;
+                }
+                selectedAudioTrackRef.current = index;
+                audioTrackCountRef.current = trackCount;
+                pushNativeLog('selectAudioTrack', `index=${index} count=${trackCount}`);
+                // Best effort only: the remuxed file below is authoritative.
                 try {
-                  const list = videoRef.current.audioTracks;
-                  for (let i = 0; i < list.length; i++) {
-                    if (list[i]) {
-                      list[i].enabled = i === payload.index;
+                  const list = videoRef.current?.audioTracks;
+                  if (list && typeof list.length === 'number') {
+                    for (let i = 0; i < list.length; i++) {
+                      if (list[i]) {
+                        list[i].enabled = i === index;
+                      }
                     }
                   }
-                  sendEventToWeb({
-                    name: 'audiotracks',
-                    audioTracks: extractAudioTracks(),
-                  });
-                } catch (err) {
-                  reportNativeActionFailure('selectAudioTrack', err);
+                } catch (err: any) {
+                  pushNativeLog('selectAudioTrack_native_skipped', err?.message || String(err));
                 }
+                sendEventToWeb({
+                  name: 'audiotracks',
+                  audioTracks: extractAudioTracks(index),
+                });
+                restartProxyAt(reportedTime(), undefined, false, index, trackCount).catch(
+                  (err: any) => {
+                    pushNativeLog(
+                      'selectAudioTrack_restart_failed',
+                      err?.message || String(err),
+                    );
+                  },
+                );
               }
               break;
             case 'selectTextTrack':
@@ -803,7 +868,6 @@ export const App = () => {
               sourceUrlRef.current = '';
               sourceHeadersRef.current = null;
               sourceBaseTimeRef.current = 0;
-              sourceTotalBytesRef.current = 0;
               break;
           }
         }
@@ -952,6 +1016,14 @@ export const App = () => {
               ) {
                 return;
               }
+              // Advancing native time is the strongest proof that real frames
+              // reached the display, even when onCanPlay/onPlaying are not
+              // delivered for file:// sources on Vega.
+              if (!hasPlayedOrCanPlayRef.current && typeof current === 'number' && current > 0.15) {
+                hasPlayedOrCanPlayRef.current = true;
+                clearPrerollWatchdog();
+                pushNativeLog('playback_started', `time=${current.toFixed(2)}`);
+              }
               sendEventToWeb({
                 name: 'timeupdate',
                 currentTime: reportedTime(),
@@ -969,18 +1041,6 @@ export const App = () => {
                 seekTimeoutRef.current = null;
               }
               isSeekingRef.current = false;
-              let needsRestart = false;
-              try {
-                if (proxySessionRef.current) {
-                  needsRestart = Boolean(NuvioMediaProxy.proxyStatus(proxySessionRef.current).needsRestart);
-                }
-              } catch (_) {
-                // Fall through to the real media error below.
-              }
-              if (needsRestart) {
-                restartProxyAt(reportedTime(), undefined, true);
-                return;
-              }
               captureProxyLog();
               stopProxyPlayback();
               const mediaErr = err?.target?.error || videoRef.current?.error;

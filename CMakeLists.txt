@@ -34,9 +34,10 @@ target_link_libraries(NuvioMediaProxy PRIVATE dl)
 
 install(TARGETS NuvioMediaProxy)
 
-# Kepler apps have their own /usr/lib inside the sandbox. Ship the exact
-# libav* build that matches the device's ffprobe binary and load it from the
-# module directory instead of the incompatible app libraries.
+# Kepler apps have their own /usr/lib inside the sandbox with an incompatible
+# libav* ABI. Ship the complete FFmpeg runtime next to the TurboModule and run
+# it through the packaged loader, so playback never uses system tools/libs.
 if(VODKA_ARCH STREQUAL "armv7")
   install(DIRECTORY kepler/turbo-modules/libs/armv7/ DESTINATION lib USE_SOURCE_PERMISSIONS)
+  install(DIRECTORY kepler/turbo-modules/bin/armv7/ DESTINATION lib USE_SOURCE_PERMISSIONS)
 endif()

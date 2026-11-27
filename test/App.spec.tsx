@@ -91,6 +91,20 @@ const preparingStatus = (generation: number = 1) => ({
   endOfStream: 0,
 });
 
+const endOfStreamStatus = () => ({
+  state: 'preparing',
+  phase: 'preparing',
+  bytesWritten: 0,
+  exitCode: 0,
+  error: '',
+  log: '',
+  playbackGeneration: 0,
+  generationInFlight: 1,
+  segmentDone: 1,
+  endOfStream: 1,
+  playbackDiagnostic: 'Segment produced only 0 bytes',
+});
+
 const openVideo = async () => {
   const rendered = render(<App />);
   const {UNSAFE_getByType} = rendered;
@@ -111,11 +125,21 @@ const openVideo = async () => {
 };
 
 describe('App', () => {
+  let logs: string[] = [];
+
   beforeEach(() => {
+    logs = [];
+    jest.spyOn(console, 'info').mockImplementation((...args: any[]) => {
+      logs.push(args.join(' '));
+    });
     (NuvioMediaProxy.startProxy as jest.Mock).mockClear();
     (NuvioMediaProxy.preparePlayback as jest.Mock).mockClear();
     (NuvioMediaProxy.proxyStatus as jest.Mock).mockReset();
     (NuvioMediaProxy.proxyStatus as jest.Mock).mockReturnValue(readyStatus());
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   it('renders without crashing', () => {
@@ -172,6 +196,36 @@ describe('App', () => {
     });
     expect(UNSAFE_queryByType('Video' as any)).toBeNull();
     rendered.unmount();
+  });
+
+  it('forwards the source generation on every open so repeat opens are not superseded', async () => {
+    const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
+    const startProxy = NuvioMediaProxy.startProxy as jest.Mock;
+    proxyStatus.mockImplementation(() => {
+      const call = startProxy.mock.calls[startProxy.mock.calls.length - 1];
+      return readyStatus(call ? call[0].generation : 1);
+    });
+    const {webView, UNSAFE_getByType, unmount} = await openVideo();
+    await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
+    expect(startProxy.mock.calls[0][0].generation).toBe(1);
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'open',
+            url: 'https://example.test/second.mkv',
+            headers: null,
+          }),
+        },
+      });
+    });
+
+    await waitFor(() => expect(startProxy).toHaveBeenCalledTimes(2));
+    expect(startProxy.mock.calls[1][0].generation).toBe(2);
+    await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
+    unmount();
   });
 
   it('rebuilds from the network at the current time when audio changes', async () => {
@@ -249,6 +303,75 @@ describe('App', () => {
 
     expect(NuvioMediaProxy.startProxy).toHaveBeenCalledTimes(1);
     expect(NuvioMediaProxy.preparePlayback).not.toHaveBeenCalled();
+    expect(logs.join('\n')).not.toContain('[ended]');
+    expect(logs.join('\n')).not.toContain('[fatalError]');
+    unmount();
+  });
+
+  it('treats an empty first segment as EOF, not as a fatal playback error', async () => {
+    (NuvioMediaProxy.proxyStatus as jest.Mock).mockReturnValue(
+      endOfStreamStatus(),
+    );
+    const rendered = render(<App />);
+    const webView = rendered.UNSAFE_getByType('WebView' as any);
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'open',
+            url: 'https://example.test/short.mkv',
+            headers: null,
+          }),
+        },
+      });
+    });
+    expect(rendered.UNSAFE_queryByType('Video' as any)).toBeNull();
+    const output = logs.join('\n');
+    expect(output).toMatch(/\[proxy_failed\][^\n]*END_OF_STREAM/);
+    expect(output).not.toContain('[fatalError]');
+    rendered.unmount();
+  });
+
+  it('preserves a paused player across the remount caused by a seek', async () => {
+    const proxyStatus = NuvioMediaProxy.proxyStatus as jest.Mock;
+    const preparePlayback = NuvioMediaProxy.preparePlayback as jest.Mock;
+    proxyStatus.mockImplementation(() => {
+      const call = preparePlayback.mock.calls[0];
+      return readyStatus(call ? call[0].generation : 1);
+    });
+    const {webView, UNSAFE_getByType, unmount} = await openVideo();
+    await waitFor(() => expect(UNSAFE_getByType('Video' as any)).toBeTruthy());
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'pause',
+          }),
+        },
+      });
+    });
+    await waitFor(() =>
+      expect(UNSAFE_getByType('Video' as any).props.autoplay).toBe(false),
+    );
+
+    await act(async () => {
+      webView.props.onMessage({
+        nativeEvent: {
+          data: JSON.stringify({
+            type: 'NUVIO_VEGA_PLAYER',
+            action: 'seek',
+            positionMs: 300000,
+          }),
+        },
+      });
+    });
+    await waitFor(() => expect(preparePlayback).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(UNSAFE_getByType('Video' as any).props.autoplay).toBe(false),
+    );
     unmount();
   });
 

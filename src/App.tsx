@@ -66,13 +66,14 @@ const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
 // replacement. Renaming a file that is still open is safe on Linux, but this
 // avoids racing a remount with cleanup.
 const PROXY_RETIRE_DELAY_MS = 8000;
-const MEDIA_ERROR_RETRY_WINDOW_MS = 4000;
 // ffmpeg exits cleanly with an empty file when the requested source position
 // is at or past the end of the stream. That is a normal EOF, not a failure.
 const END_OF_STREAM_ERROR = 'END_OF_STREAM';
+const WAIT_CANCELLED = 'Playback preparation cancelled';
+const SUPERSEDED = 'Segment build superseded';
 // Start building the following bounded segment early enough that the native
 // remount at the boundary costs only a few frames. The native side caps each
-// segment at 192 MiB, so this is roughly a minute of playback in practice.
+// segment at 192 MiB, regardless of how many minutes that represents.
 const PREPARE_NEXT_AHEAD_SEC = 60;
 
 type AudioTrackMetadata = {
@@ -89,6 +90,10 @@ type RebuildOptions = {
   audioTrackIndex?: number;
   audioTrackCount?: number;
   notifySeeked?: boolean;
+  /** Retry from the preroll watchdog must keep its one-shot flag armed. */
+  keepPrerollRetry?: boolean;
+  previousAudioTrackIndex?: number;
+  previousAudioTrackCount?: number;
 };
 
 /**
@@ -111,6 +116,7 @@ export const App = () => {
   const [sourcePendingToken, setSourcePendingToken] = useState<number>(0);
   const [playbackKey, setPlaybackKey] = useState<number>(0);
   const [showCaptions, setShowCaptions] = useState<boolean>(true);
+  const [autoplay, setAutoplay] = useState<boolean>(true);
 
   // There is exactly one proxy session per source. Each ffmpeg run fetches one
   // bounded segment from the network into a complete local MKV. <Video> only
@@ -135,12 +141,14 @@ export const App = () => {
   const pendingSeekSecRef = useRef<number | null>(null);
   const proxyLogTailRef = useRef<string>('');
   const playbackGenerationRef = useRef<number>(0);
+  /** Last generation issued by any build; stale continuations are ignored. */
+  const latestGenerationRef = useRef<number>(0);
+  const waiterCancellersRef = useRef<Set<() => void>>(new Set());
+  const mountedRef = useRef<boolean>(true);
   const prerollRetryRef = useRef<boolean>(false);
   const nativeErrorCountRef = useRef<number>(0);
-  const lastNativeErrorAtRef = useRef<number>(0);
   const lastMountAtRef = useRef<number>(0);
   const isSwitchingRef = useRef<boolean>(false);
-  const playingRef = useRef<boolean>(false);
 
   const sourceUrlRef = useRef<string>('');
   const sourceHeadersRef = useRef<Record<string, string> | null>(null);
@@ -155,7 +163,6 @@ export const App = () => {
     generation: number;
   } | null>(null);
   const sourceGenerationRef = useRef<number>(0);
-  const preparingSourceRef = useRef<boolean>(false);
   const prerollWatchdogRef = useRef<any>(null);
   const hasPlayedOrCanPlayRef = useRef<boolean>(false);
   const nativeLogsRef = useRef<Array<string>>([]);
@@ -210,18 +217,21 @@ export const App = () => {
       const sessionId = proxySessionRef.current;
       proxySessionRef.current = null;
       if (sessionId) {
-        captureProxyLog();
         lastProxySessionRef.current = sessionId;
+        captureProxyLog();
         pushNativeLog('proxy_stopped', `session=${sessionId} delay=${delayMs}`);
         const retire = () => {
+          retiredProxyTimersRef.current = retiredProxyTimersRef.current.filter(
+            (item) => item !== timer,
+          );
           try {
             NuvioMediaProxy.stopProxy(sessionId);
           } catch (err: any) {
             console.warn('[VegaPlayer] stopProxy failed:', err);
           }
         };
-        if (delayMs > 0) {
-          const timer = setTimeout(retire, delayMs);
+        const timer = delayMs > 0 ? setTimeout(retire, delayMs) : null;
+        if (timer) {
           retiredProxyTimersRef.current.push(timer);
         } else {
           retire();
@@ -476,23 +486,31 @@ export const App = () => {
         let lastPhase = '';
         let lastBytes = -1;
         let settled = false;
+        let cancel: () => void = () => {};
 
         const finish = (callback: (value: any) => void, value: any) => {
           if (settled) {
             return;
           }
           settled = true;
+          waiterCancellersRef.current.delete(cancel);
           if (timer) {
             clearTimeout(timer);
             timer = null;
           }
           callback(value);
         };
+        cancel = () => finish(reject, new Error(WAIT_CANCELLED));
+        waiterCancellersRef.current.add(cancel);
 
         const tick = () => {
           const status = readStatus(sessionId);
           if (!status) {
             finish(reject, new Error('Local media proxy is unavailable'));
+            return;
+          }
+          if (status.state === 'missing') {
+            finish(reject, new Error('Local media session was stopped'));
             return;
           }
           const phase = String(status.phase || status.state || '');
@@ -537,7 +555,7 @@ export const App = () => {
           ) {
             // A newer seek/audio change replaced this build. It is not an
             // error: the caller that requested it owns the outcome.
-            finish(reject, new Error('Segment build superseded'));
+            finish(reject, new Error(SUPERSEDED));
             return;
           }
           if (
@@ -566,12 +584,18 @@ export const App = () => {
     [captureProxyLog, readStatus],
   );
 
+  const cancelAllWaiters = useCallback(() => {
+    const cancellers = [...waiterCancellersRef.current];
+    waiterCancellersRef.current.clear();
+    cancellers.forEach((cancel) => cancel());
+  }, []);
+
   const startPrerollWatchdog = useCallback(
     (url: string) => {
       clearPrerollWatchdog();
       prerollWatchdogRef.current = setTimeout(() => {
         prerollWatchdogRef.current = null;
-        if (hasPlayedOrCanPlayRef.current) {
+        if (!mountedRef.current || hasPlayedOrCanPlayRef.current) {
           return;
         }
         const target = videoRef.current;
@@ -585,7 +609,9 @@ export const App = () => {
         // segment and remount once before showing any error to the user.
         if (!prerollRetryRef.current && proxySessionRef.current) {
           prerollRetryRef.current = true;
-          restartPlaybackAtRef.current(sourceBaseTimeRef.current, {});
+          restartPlaybackAtRef.current(sourceBaseTimeRef.current, {
+            keepPrerollRetry: true,
+          });
           return;
         }
         captureProxyLog();
@@ -640,6 +666,7 @@ export const App = () => {
         startTimeSec,
         audioTrackIndex,
         audioTrackCount,
+        generation,
       });
       if (result?.error) {
         throw new Error(result.error);
@@ -735,7 +762,18 @@ export const App = () => {
       generation: number,
       options: RebuildOptions,
     ) => {
+      const sourceGeneration = sourceGenerationRef.current;
       await buildSegment(sessionId, timeSec, generation, options);
+      if (
+        !mountedRef.current ||
+        sessionId !== proxySessionRef.current ||
+        sourceGeneration !== sourceGenerationRef.current ||
+        generation !== latestGenerationRef.current
+      ) {
+        // A newer open/seek/audio change owns the player now. Its build is the
+        // only one allowed to remount the native Video.
+        throw new Error(WAIT_CANCELLED);
+      }
       preparedNextRef.current = null;
       nextPrepInFlightRef.current = false;
       endOfStreamRef.current = false;
@@ -766,21 +804,31 @@ export const App = () => {
       if (!sessionId || nextPrepInFlightRef.current) {
         return;
       }
+      const sourceGeneration = sourceGenerationRef.current;
+      const localUrl = localUrlRef.current || videoUrl;
       nextPrepInFlightRef.current = true;
       const generation = nextGeneration();
+      latestGenerationRef.current = generation;
       pushNativeLog(
         'next_segment_prep',
         `start=${startSec.toFixed(2)} generation=${generation}`,
       );
+      const isCurrent = () =>
+        mountedRef.current &&
+        sourceGeneration === sourceGenerationRef.current &&
+        sessionId === proxySessionRef.current &&
+        generation === latestGenerationRef.current;
       try {
         await buildSegment(sessionId, startSec, generation, {});
-        preparedNextRef.current = {
-          localUrl: localUrlRef.current || videoUrl,
-          generation,
-          startSec,
-        };
+        if (!isCurrent()) {
+          return;
+        }
+        preparedNextRef.current = {localUrl, generation, startSec};
         pushNativeLog('next_segment_ready', `start=${startSec.toFixed(2)}`);
       } catch (err: any) {
+        if (!isCurrent()) {
+          return;
+        }
         if (err?.message === END_OF_STREAM_ERROR) {
           preparedNextRef.current = null;
           endOfStreamRef.current = true;
@@ -792,7 +840,9 @@ export const App = () => {
           );
         }
       } finally {
-        nextPrepInFlightRef.current = false;
+        if (generation === latestGenerationRef.current) {
+          nextPrepInFlightRef.current = false;
+        }
       }
     },
     [buildSegment, nextGeneration, pushNativeLog, videoUrl],
@@ -850,10 +900,14 @@ export const App = () => {
       }
       sourceUrlRef.current = url;
       sourceHeadersRef.current = headers;
-      playbackGenerationRef.current = generation;
+      latestGenerationRef.current = generation;
       startStatusPolling(session.sessionId, generation);
       const status = await waitForPlaybackReady(session.sessionId, generation);
-      if (generation !== sourceGenerationRef.current) {
+      if (
+        !mountedRef.current ||
+        generation !== sourceGenerationRef.current ||
+        generation !== latestGenerationRef.current
+      ) {
         return;
       }
       readAudioMetadata(status.audioTracks);
@@ -887,11 +941,15 @@ export const App = () => {
         return;
       }
       const generation = nextGeneration();
+      const sourceGeneration = sourceGenerationRef.current;
+      latestGenerationRef.current = generation;
       preparedNextRef.current = null;
       nextPrepInFlightRef.current = false;
       endOfStreamRef.current = false;
       isSwitchingRef.current = true;
-      prerollRetryRef.current = false;
+      if (!options.keepPrerollRetry) {
+        prerollRetryRef.current = false;
+      }
       clearPrerollWatchdog();
       try {
         await rebuildPlayback(
@@ -903,13 +961,31 @@ export const App = () => {
         );
       } catch (err: any) {
         const message = err?.message || String(err || 'local rebuild failed');
+        if (
+          message === WAIT_CANCELLED ||
+          message === SUPERSEDED ||
+          !mountedRef.current ||
+          sourceGeneration !== sourceGenerationRef.current ||
+          generation !== latestGenerationRef.current
+        ) {
+          // A newer operation owns the outcome; never emit seeked or undo its
+          // audio selection.
+          return;
+        }
         pushNativeLog('rebuild_failed', message);
         isSwitchingRef.current = false;
         if (options.audioTrackIndex !== undefined) {
+          selectedAudioTrackRef.current = options.previousAudioTrackIndex ?? -1;
+          audioTrackCountRef.current = options.previousAudioTrackCount ?? 0;
           sendAudioTracks();
         }
         if (options.notifySeeked) {
           sendEventToWeb({name: 'seeked', currentTime: reportedTime()});
+        }
+        if (options.keepPrerollRetry) {
+          // The retried file is still unplayable. Let the watchdog escalate
+          // once, instead of leaving the user on a permanently black player.
+          startPrerollWatchdog(localUrlRef.current || videoUrl);
         }
         // A failed seek/audio change is recoverable: the previous local file
         // remains mounted and the movie keeps playing.
@@ -923,6 +999,7 @@ export const App = () => {
       reportedTime,
       sendAudioTracks,
       sendEventToWeb,
+      startPrerollWatchdog,
       videoUrl,
     ],
   );
@@ -934,6 +1011,13 @@ export const App = () => {
    * stopped. Only a clean EOF at that point is reported as the real end.
    */
   const handleNativeEnded = useCallback(async () => {
+    if (
+      !mountedRef.current ||
+      isSwitchingRef.current ||
+      !hasPlayedOrCanPlayRef.current
+    ) {
+      return;
+    }
     const timeSec = reportedTime();
     const durationSec = reportedDuration();
     if (durationSec > 0 && timeSec < durationSec - 1) {
@@ -967,6 +1051,9 @@ export const App = () => {
       sendEventToWeb({name: 'ended'});
       return;
     }
+    const generation = nextGeneration();
+    const sourceGeneration = sourceGenerationRef.current;
+    latestGenerationRef.current = generation;
     isSwitchingRef.current = true;
     clearPrerollWatchdog();
     pushNativeLog('segment_on_demand', `start=${startSec.toFixed(2)}`);
@@ -975,13 +1062,23 @@ export const App = () => {
         sessionId,
         localUrlRef.current || videoUrl,
         startSec,
-        nextGeneration(),
+        generation,
         {},
       );
-      isSwitchingRef.current = false;
     } catch (err: any) {
-      isSwitchingRef.current = false;
       const reason = err?.message || String(err || 'segment build failed');
+      if (
+        reason === WAIT_CANCELLED ||
+        reason === SUPERSEDED ||
+        !mountedRef.current ||
+        sourceGeneration !== sourceGenerationRef.current ||
+        generation !== latestGenerationRef.current
+      ) {
+        // A seek/open/close superseded this rebuild. A new source must never
+        // receive the previous source's terminal `ended` event.
+        return;
+      }
+      isSwitchingRef.current = false;
       pushNativeLog('segment_on_demand_failed', reason);
       // The mounted file has already reached EOS, so staying silent would
       // leave the UI stuck on a finished player. EOF and an unreachable
@@ -1003,7 +1100,9 @@ export const App = () => {
 
   const handleNativeMediaError = useCallback(
     (err: any) => {
-      clearPrerollWatchdog();
+      if (!mountedRef.current) {
+        return;
+      }
       const mediaErr = err?.target?.error || videoRef.current?.error;
       const code =
         mediaErr?.code || (typeof err?.code === 'number' ? err.code : 4);
@@ -1016,27 +1115,17 @@ export const App = () => {
       pushNativeLog('native_media_error', msg);
       captureProxyLog();
 
-      // Decoder errors immediately after a rebuild are often a transient
-      // reconfiguration. Retry once from the network at the current position
-      // before considering the playback broken.
-      const now = Date.now();
-      if (
-        (isSwitchingRef.current || now - lastMountAtRef.current < 2000) &&
-        nativeErrorCountRef.current === 0
-      ) {
+      // One decoder error is a transient reconfiguration and must never show
+      // an error screen. A second error without a successful playback in
+      // between means the file really cannot be rendered.
+      if (nativeErrorCountRef.current === 0) {
         nativeErrorCountRef.current = 1;
-        lastNativeErrorAtRef.current = now;
-        restartPlaybackAtRef.current(reportedTime(), {});
-        return;
-      }
-      if (now - lastNativeErrorAtRef.current < MEDIA_ERROR_RETRY_WINDOW_MS) {
-        nativeErrorCountRef.current += 1;
-        if (nativeErrorCountRef.current < 2) {
-          return;
+        if (
+          isSwitchingRef.current ||
+          Date.now() - lastMountAtRef.current < 2000
+        ) {
+          restartPlaybackAtRef.current(reportedTime(), {});
         }
-      } else {
-        nativeErrorCountRef.current = 1;
-        lastNativeErrorAtRef.current = now;
         return;
       }
       forwardNativeError('native-media-error', msg, code, {
@@ -1045,13 +1134,7 @@ export const App = () => {
         proxyLog: proxyLogTailRef.current,
       });
     },
-    [
-      captureProxyLog,
-      clearPrerollWatchdog,
-      forwardNativeError,
-      pushNativeLog,
-      reportedTime,
-    ],
+    [captureProxyLog, forwardNativeError, pushNativeLog, reportedTime],
   );
 
   const prepareSource = useCallback(async () => {
@@ -1061,48 +1144,55 @@ export const App = () => {
     }
     pendingSourceRef.current = null;
     const {url, headers, generation} = pending;
-    if (generation !== sourceGenerationRef.current) {
+    if (generation !== sourceGenerationRef.current || !mountedRef.current) {
       return;
     }
-    preparingSourceRef.current = true;
     try {
-      pushNativeLog(
-        'source_probe',
-        'fetching source once into a local master file',
-      );
+      pushNativeLog('source_probe', 'building first bounded segment');
       await applyProxySource(url, headers, 0, generation);
     } catch (err: any) {
-      if (generation !== sourceGenerationRef.current) {
+      const message =
+        err?.message || String(err || 'local media preparation failed');
+      if (
+        generation !== sourceGenerationRef.current ||
+        !mountedRef.current ||
+        message === WAIT_CANCELLED ||
+        message === SUPERSEDED ||
+        message === 'Local media session was stopped'
+      ) {
+        // Superseded by a newer open/seek or cancelled by close: the owning
+        // operation reports the outcome, never this one.
         return;
       }
       clearPrerollWatchdog();
-      const message =
-        err?.message || String(err || 'local media preparation failed');
       pushNativeLog('proxy_failed', message);
       stopProxyPlayback();
+      if (message === END_OF_STREAM_ERROR) {
+        // An empty result at the requested position is a normal EOF.
+        sendEventToWeb({name: 'ended'});
+        return;
+      }
       forwardNativeError('proxy-start-failed', message, 4, {
         url,
         proxyLog: proxyLogTailRef.current,
       });
-    } finally {
-      if (generation === sourceGenerationRef.current) {
-        preparingSourceRef.current = false;
-      }
     }
   }, [
     applyProxySource,
     clearPrerollWatchdog,
     forwardNativeError,
     pushNativeLog,
+    sendEventToWeb,
     stopProxyPlayback,
   ]);
 
   const openSource = useCallback(
     (url: string, incomingHeaders: Record<string, string> | null) => {
       clearPrerollWatchdog();
-      stopProxyPlayback();
+      cancelAllWaiters();
+      stopProxyPlayback(PROXY_RETIRE_DELAY_MS);
       sourceGenerationRef.current += 1;
-      preparingSourceRef.current = false;
+      setAutoplay(true);
       hasPlayedOrCanPlayRef.current = false;
       isSwitchingRef.current = false;
       prerollRetryRef.current = false;
@@ -1116,7 +1206,6 @@ export const App = () => {
       segmentEndSecRef.current = 0;
       nativeLogsRef.current = [];
       proxyLogTailRef.current = '';
-      playingRef.current = false;
       const headers =
         incomingHeaders && Object.keys(incomingHeaders).length > 0
           ? incomingHeaders
@@ -1136,7 +1225,7 @@ export const App = () => {
       setVideoUrl('');
       setSourcePendingToken((prev) => prev + 1);
     },
-    [clearPrerollWatchdog, pushNativeLog, stopProxyPlayback],
+    [cancelAllWaiters, clearPrerollWatchdog, pushNativeLog, stopProxyPlayback],
   );
 
   const handleMessage = useCallback(
@@ -1169,8 +1258,8 @@ export const App = () => {
             break;
           case 'setHeaders':
           case 'prepare': {
-            // Headers apply to the single master download. Late header updates
-            // cannot be used for a rebuild and must never restart the network.
+            // Headers are captured once by the native session. Late updates are
+            // retained for the next open; they must never restart this source.
             if (payload.headers && typeof payload.headers === 'object') {
               const merged = {
                 ...(sourceHeadersRef.current || {}),
@@ -1187,7 +1276,7 @@ export const App = () => {
             break;
           }
           case 'play':
-            playingRef.current = true;
+            setAutoplay(true);
             try {
               videoRef.current
                 ?.play()
@@ -1197,7 +1286,7 @@ export const App = () => {
             }
             break;
           case 'pause':
-            playingRef.current = false;
+            setAutoplay(false);
             try {
               videoRef.current?.pause();
             } catch (err: any) {
@@ -1207,6 +1296,7 @@ export const App = () => {
           case 'seek': {
             if (
               typeof payload.positionMs !== 'number' ||
+              !Number.isFinite(payload.positionMs) ||
               !proxySessionRef.current
             ) {
               break;
@@ -1225,15 +1315,20 @@ export const App = () => {
             ) {
               break;
             }
-            const trackIndex = Math.floor(index);
-            if (trackIndex === selectedAudioTrackRef.current) {
-              break;
-            }
             const trackCount =
-              Number(payload.trackCount) > 0
+              Number.isFinite(payload.trackCount) && payload.trackCount > 0
                 ? Math.floor(payload.trackCount)
                 : proxyAudioMetadataRef.current.length ||
                   audioTrackCountRef.current;
+            const trackIndex =
+              trackCount > 0
+                ? Math.min(Math.floor(index), trackCount - 1)
+                : Math.floor(index);
+            if (trackIndex === selectedAudioTrackRef.current) {
+              break;
+            }
+            const previousAudioTrackIndex = selectedAudioTrackRef.current;
+            const previousAudioTrackCount = audioTrackCountRef.current;
             selectedAudioTrackRef.current = trackIndex;
             audioTrackCountRef.current = trackCount;
             pushNativeLog(
@@ -1251,6 +1346,8 @@ export const App = () => {
             restartPlaybackAt(reportedTime(), {
               audioTrackIndex: trackIndex,
               audioTrackCount: trackCount,
+              previousAudioTrackIndex,
+              previousAudioTrackCount,
             });
             break;
           }
@@ -1297,7 +1394,11 @@ export const App = () => {
             }
             break;
           case 'rate':
-            if (typeof payload.rate === 'number' && videoRef.current) {
+            if (
+              typeof payload.rate === 'number' &&
+              Number.isFinite(payload.rate) &&
+              videoRef.current
+            ) {
               try {
                 videoRef.current.playbackRate = payload.rate;
               } catch (err: any) {
@@ -1307,6 +1408,7 @@ export const App = () => {
             break;
           case 'stop':
             clearPrerollWatchdog();
+            setAutoplay(false);
             pushNativeLog('stop');
             try {
               videoRef.current?.pause();
@@ -1316,9 +1418,10 @@ export const App = () => {
             break;
           case 'close':
             clearPrerollWatchdog();
+            cancelAllWaiters();
             stopProxyPlayback();
             sourceGenerationRef.current += 1;
-            preparingSourceRef.current = false;
+            setAutoplay(true);
             hasPlayedOrCanPlayRef.current = false;
             isSwitchingRef.current = false;
             prerollRetryRef.current = false;
@@ -1331,7 +1434,6 @@ export const App = () => {
             segmentEndSecRef.current = 0;
             nativeLogsRef.current = [];
             proxyLogTailRef.current = '';
-            playingRef.current = false;
             pushNativeLog('close');
             setVideoUrl('');
             sourceUrlRef.current = '';
@@ -1346,6 +1448,7 @@ export const App = () => {
       }
     },
     [
+      cancelAllWaiters,
       clearPrerollWatchdog,
       extractAudioTracks,
       extractTextTracks,
@@ -1379,12 +1482,15 @@ export const App = () => {
 
   React.useEffect(() => {
     return () => {
+      mountedRef.current = false;
+      sourceGenerationRef.current += 1;
+      cancelAllWaiters();
       clearPrerollWatchdog();
       stopProxyPlayback();
       retiredProxyTimersRef.current.forEach((timer) => clearTimeout(timer));
       retiredProxyTimersRef.current = [];
     };
-  }, [clearPrerollWatchdog, stopProxyPlayback]);
+  }, [cancelAllWaiters, clearPrerollWatchdog, stopProxyPlayback]);
 
   return (
     <View style={styles.container}>
@@ -1394,7 +1500,7 @@ export const App = () => {
             ref={videoRef}
             key={`${playbackKey}:${videoUrl}`}
             src={videoUrl}
-            autoplay={true}
+            autoplay={autoplay}
             preload="auto"
             width={WINDOW_WIDTH || 1920}
             height={WINDOW_HEIGHT || 1080}

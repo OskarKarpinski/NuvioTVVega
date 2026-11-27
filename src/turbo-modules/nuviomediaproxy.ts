@@ -12,6 +12,8 @@ export type MediaProxyConfig = {
   audioTrackIndex?: number;
   /** Number of audio streams exposed by the player, for dispositions. */
   audioTrackCount?: number;
+  /** Source generation shared with waitForPlaybackReady. */
+  generation: number;
 };
 
 export type MediaPlaybackConfig = {
@@ -52,7 +54,7 @@ export type MediaProxyStatus = {
   selfTest?: string;
   /** Generation of the last fully written segment. */
   playbackGeneration: number;
-  /** Generation currently being built; -1 when idle. */
+  /** Generation of the current build; kept after exit so segmentDone can be matched. */
   generationInFlight?: number;
   /** 1 once the in-flight ffmpeg process has exited. */
   segmentDone?: number;

@@ -45,10 +45,14 @@ constexpr const char* FFMPEG_BINARY = "libnuvioffmpeg.so";
 constexpr const char* LOADER_BINARY = "ld-linux-armhf.so.3";
 constexpr const char* SELF_TEST_PATH = "/tmp/nuvio-selftest.log";
 
-/** One ffmpeg run never writes more than this to the device. */
-constexpr long long MAX_SEGMENT_BYTES = 192LL * 1024 * 1024;
+/**
+ * Requested ffmpeg limit. -fs stops after crossing the threshold, so the
+ * margin keeps the actual file below the 192 MiB device budget even when one
+ * Matroska cluster overshoots the requested value.
+ */
+constexpr long long MAX_SEGMENT_BYTES = 160LL * 1024 * 1024;
 /** A playback file smaller than this is not safe to hand to the native demuxer. */
-constexpr long long MIN_PLAYBACK_BYTES = 128LL * 1024;
+constexpr long long MIN_PLAYBACK_BYTES = 32LL * 1024;
 constexpr long long LOG_TAIL_BYTES = 8 * 1024;
 
 struct ProxySession {
@@ -194,35 +198,42 @@ std::vector<std::string> sanitizedEnvironment(const std::string& libraries) {
 }
 
 /**
- * Launches the bundled ffmpeg through the bundled dynamic loader. Kepler runs
- * the app with AT_SECURE, where LD_LIBRARY_PATH is ignored for children, so an
- * explicit --library-path is required to keep the app's libav* out of the way.
+ * Everything the child needs is prepared before fork(). Kepler runs the app
+ * with AT_SECURE, where LD_LIBRARY_PATH is ignored for children, so the bundled
+ * loader gets an explicit --library-path to keep the app's libav* out of the
+ * way. This process is multithreaded; after fork() only async-signal-safe calls
+ * are allowed, so no allocation, stdio or dladdr() happens on the child side.
  */
-void execChild(const std::vector<std::string>& argv) {
-  const std::string libraries = moduleDirectory();
+struct ChildExecPlan {
   std::vector<std::string> command;
+  std::vector<std::string> environment;
+  std::vector<char*> argv;
+  std::vector<char*> envp;
+};
 
+void prepareChildExec(const std::vector<std::string>& argv,
+                      ChildExecPlan& plan) {
+  const std::string libraries = moduleDirectory();
   const std::string loader = bundledPath(LOADER_BINARY);
   if (access(loader.c_str(), X_OK) == 0) {
-    command.push_back(loader);
-    command.push_back("--library-path");
-    command.push_back(libraries + ":/lib:/usr/lib");
+    plan.command.push_back(loader);
+    plan.command.push_back("--library-path");
+    plan.command.push_back(libraries + ":/lib:/usr/lib");
   }
-  command.insert(command.end(), argv.begin(), argv.end());
-
-  auto pointers = argvPointers(command);
-  auto environment = sanitizedEnvironment(libraries);
-  std::vector<char*> environmentPointers;
-  environmentPointers.reserve(environment.size() + 1);
-  for (auto& item : environment) {
-    environmentPointers.push_back(const_cast<char*>(item.c_str()));
+  plan.command.insert(plan.command.end(), argv.begin(), argv.end());
+  plan.environment = sanitizedEnvironment(libraries);
+  plan.argv = argvPointers(plan.command);
+  plan.envp.reserve(plan.environment.size() + 1);
+  for (auto& item : plan.environment) {
+    plan.envp.push_back(const_cast<char*>(item.c_str()));
   }
-  environmentPointers.push_back(nullptr);
+  plan.envp.push_back(nullptr);
+}
 
-  execve(pointers[0], pointers.data(), environmentPointers.data());
-  const std::string message =
-      std::string("execve failed for ") + argv[0] + ": " + strerror(errno) + "\n";
-  write(STDERR_FILENO, message.data(), message.size());
+void execChild(const ChildExecPlan& plan) {
+  execve(plan.argv[0], plan.argv.data(), plan.envp.data());
+  static const char message[] = "execve failed for bundled ffmpeg\n";
+  write(STDERR_FILENO, message, sizeof(message) - 1);
   _exit(127);
 }
 
@@ -243,6 +254,8 @@ int runCapture(
     return -1;
   }
 
+  ChildExecPlan plan;
+  prepareChildExec(argv, plan);
   const pid_t pid = fork();
   if (pid < 0) {
     close(outPipe[0]);
@@ -263,7 +276,7 @@ int runCapture(
       dup2(devNull, STDIN_FILENO);
       close(devNull);
     }
-    execChild(argv);
+    execChild(plan);
   }
 
   close(outPipe[1]);
@@ -739,6 +752,8 @@ JSObject errorResult(const std::string& message) {
 pid_t launchStage(const std::vector<std::string>& argv,
                   const std::string& stdoutPath,
                   const std::string& stderrPath) {
+  ChildExecPlan plan;
+  prepareChildExec(argv, plan);
   const pid_t pid = fork();
   if (pid < 0) {
     return -1;
@@ -759,7 +774,7 @@ pid_t launchStage(const std::vector<std::string>& argv,
       dup2(log, STDERR_FILENO);
       close(log);
     }
-    execChild(argv);
+    execChild(plan);
   }
   return pid;
 }
@@ -811,19 +826,18 @@ std::vector<std::string> buildSegmentCommand(const std::string& url,
   argv.push_back("-c:s");
   argv.push_back("copy");
   // Leave exactly one default audio track so Vega does not reconfigure its
-  // pipeline in a loop. Without a track count there is nothing to select.
-  if (audioTrackCount > 0) {
-    int selected = 0;
-    if (audioTrackIndex >= 0) {
-      selected = std::min(audioTrackIndex, audioTrackCount - 1);
-    }
-    argv.push_back("-disposition:a");
-    argv.push_back("0");
-    std::ostringstream defaultSpecifier;
-    defaultSpecifier << "-disposition:a:" << selected;
-    argv.push_back(defaultSpecifier.str());
-    argv.push_back("default");
+  // pipeline in a loop. This also applies to the first segment, whose track
+  // count is not known to JS yet: stream 0 is the deterministic default there.
+  int selected = 0;
+  if (audioTrackIndex >= 0 && audioTrackCount > 0) {
+    selected = std::min(audioTrackIndex, audioTrackCount - 1);
   }
+  argv.push_back("-disposition:a");
+  argv.push_back("0");
+  std::ostringstream defaultSpecifier;
+  defaultSpecifier << "-disposition:a:" << selected;
+  argv.push_back(defaultSpecifier.str());
+  argv.push_back("default");
   argv.push_back("-fs");
   argv.push_back(std::to_string(MAX_SEGMENT_BYTES));
   argv.push_back("-f");
@@ -895,6 +909,23 @@ bool beginSegment(const std::shared_ptr<ProxySession>& session,
     }
     appendLogUpdatesLocked(session);
     session->previousLogPath = session->segmentLogPath;
+    // The previous monitor has been joined, so its temp file is no longer
+    // being written. Keep only the finished cachePath and one prior log.
+    for (const auto& stale : session->tempFiles) {
+      if (!stale.empty()) {
+        unlink(stale.c_str());
+      }
+    }
+    session->tempFiles.clear();
+    for (const auto& stale : session->logFiles) {
+      if (!stale.empty() && stale != session->previousLogPath) {
+        unlink(stale.c_str());
+      }
+    }
+    session->logFiles.clear();
+    if (!session->previousLogPath.empty()) {
+      session->logFiles.push_back(session->previousLogPath);
+    }
     unlink(tmpPath.c_str());
     session->segmentTmpPath = tmpPath;
     session->segmentLogPath = logPath;
@@ -942,10 +973,24 @@ bool beginSegment(const std::shared_ptr<ProxySession>& session,
     session->generationInFlight = -1;
     return false;
   }
-  {
+  try {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->segmentMonitorThread =
         std::thread(monitorProcess, session, pid, generation, tmpPath, logPath);
+  } catch (...) {
+    // Without a monitor nobody would reap this child or settle the waiter.
+    kill(pid, SIGTERM);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    unlink(tmpPath.c_str());
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->segmentPid = -1;
+    session->generationInFlight = -1;
+    session->segmentDone = true;
+    session->error = "Unable to start bundled ffmpeg monitor thread";
+    session->playbackDiagnostic = session->error;
+    return false;
   }
   return true;
 }
@@ -985,6 +1030,7 @@ void monitorProcess(const std::shared_ptr<ProxySession>& session,
       session->playbackDiagnostic = "Segment generation " +
                                     std::to_string(generation) +
                                     " was superseded before completion";
+      unlink(tmpPath.c_str());
       return;
     }
 
@@ -999,6 +1045,7 @@ void monitorProcess(const std::shared_ptr<ProxySession>& session,
         session->endOfStream = false;
         session->playbackDiagnostic =
             std::string("Unable to publish segment: ") + strerror(errno);
+        unlink(tmpPath.c_str());
       }
     } else if (exitCode == 0) {
       // Clean EOF close to the start of the source: keep any older complete
@@ -1012,6 +1059,7 @@ void monitorProcess(const std::shared_ptr<ProxySession>& session,
       // A failed seek/audio switch is recoverable; only invalid config is fatal.
       session->endOfStream = false;
       session->playbackDiagnostic = ffmpegFailure(logPath, exitCode);
+      unlink(tmpPath.c_str());
     }
   }
 }
@@ -1079,6 +1127,7 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   const double startTimeSec = valueOr<double>(config, "startTimeSec", 0);
   const double audioTrack = valueOr<double>(config, "audioTrackIndex", -1);
   const double audioTracks = valueOr<double>(config, "audioTrackCount", 0);
+  const double generationValue = valueOr<double>(config, "generation", 1);
 
   if (sessionId.empty() || url.empty()) {
     return errorResult("Missing sessionId or url");
@@ -1115,9 +1164,11 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
     gSessions[sessionId] = session;
   }
 
-  // One invocation, one bounded segment, generation 1. Returns immediately.
+  // One invocation, one bounded segment. The generation must be the same
+  // token the JS waiter uses, including after several source opens.
+  const int generation = generationValue > 0 ? static_cast<int>(generationValue) : 1;
   beginSegment(session, startTimeSec, session->audioTrackIndex,
-               session->audioTrackCount, 1);
+               session->audioTrackCount, generation);
   return statusObject(session);
 }
 

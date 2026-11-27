@@ -14,7 +14,7 @@ jest.mock('../src/turbo-modules/nuviomediaproxy', () => ({
   __esModule: true,
   default: {
     startProxy: jest.fn(() => ({
-      localUrl: 'http://127.0.0.1:12345/stream.mkv',
+      localUrl: 'file:///tmp/nuvio-proxy-test.mkv',
       port: 12345,
       cachePath: '/tmp/nuvio-proxy-test.mkv',
       logPath: '/tmp/nuvio-proxy-test.log',
@@ -71,7 +71,7 @@ describe('App', () => {
 
     await waitFor(() => {
       const video = UNSAFE_getByType('Video' as any);
-      expect(String(video.props.src)).toMatch(/^http:\/\/127\.0\.0\.1:/);
+      expect(String(video.props.src)).toBe('file:///tmp/nuvio-proxy-test.mkv');
     });
   });
 

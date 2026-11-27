@@ -378,7 +378,7 @@ export const App = () => {
       }
       pushNativeLog(
         'proxy_ready',
-        `port=${result.port} path=${result.cachePath} source=${result.sourceBytes ?? 0}`,
+        `url=${result.localUrl} path=${result.cachePath} source=${result.sourceBytes ?? 0}`,
       );
       return {
         sessionId,
@@ -459,7 +459,7 @@ export const App = () => {
       // the remote URL, not even for a single frame while ffprobe runs.
       setPlaybackKey(prev => prev + 1);
       setVideoUrl(session.localUrl);
-      startPrerollWatchdog(url);
+      startPrerollWatchdog(session.localUrl);
       startProxyPolling(session.sessionId, generation, url);
     },
     [startPrerollWatchdog, startProxyPolling, startProxySession, stopProxyPlayback],

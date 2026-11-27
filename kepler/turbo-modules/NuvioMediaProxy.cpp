@@ -46,6 +46,7 @@ constexpr long long PRESERVE_HEAD_BYTES = 256LL * 1024 * 1024;
 constexpr long long KEEP_BEHIND_BYTES = 128LL * 1024 * 1024;
 constexpr long long DEFAULT_MAX_DISK_BYTES = 768LL * 1024 * 1024;
 constexpr size_t CLIENT_CHUNK_BYTES = 64 * 1024;
+constexpr long long MIN_PREROLL_BYTES = 128LL * 1024;
 
 struct ProxySession {
   std::string id;
@@ -866,11 +867,31 @@ void serverLoop(const std::shared_ptr<ProxySession>& session) {
   socklen_t boundLength = sizeof(bound);
   getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &boundLength);
 
+  // The native Vega player blocks plain HTTP from app sources (cleartext
+  // policy), so it must open the remuxed file directly. Wait until the muxer
+  // has written a usable EBML header and first frames before handing the URI
+  // to the player; an empty file would fail before ffmpeg produces anything.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const long long size = fileSize(session->cachePath);
+    bool stopped = false;
+    bool done = false;
+    {
+      std::lock_guard<std::mutex> lock(session->mutex);
+      stopped = session->stopping;
+      done = session->ffmpegDone;
+    }
+    if (stopped || done || size >= MIN_PREROLL_BYTES) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+
   {
     std::lock_guard<std::mutex> lock(session->mutex);
     session->serverFd = fd;
     session->port = ntohs(bound.sin_port);
-    session->localUrl = "http://127.0.0.1:" + std::to_string(session->port) + "/stream.mkv";
+    session->localUrl = "file://" + session->cachePath;
     session->ready = true;
   }
   session->cv.notify_all();

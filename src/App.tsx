@@ -55,7 +55,10 @@ export const App = () => {
       console.warn('[VegaPlayer] videoRef.current is null when setting source for:', url);
       return;
     }
-    const headersStr = headers ? JSON.stringify(headers) : '';
+    const hasHeaders = Boolean(
+      headers && typeof headers === 'object' && Object.keys(headers).length > 0,
+    );
+    const headersStr = hasHeaders ? JSON.stringify(headers) : '';
     if (
       appliedSrcRef.current &&
       appliedSrcRef.current.url === url &&
@@ -67,15 +70,18 @@ export const App = () => {
 
     const player = (target as any)?.mediaPlayer_ || target;
     try {
-      if (headers && Object.keys(headers).length > 0 && typeof player?.setSrcWithCustomHeaders === 'function') {
+      if (hasHeaders && typeof player?.setSrcWithCustomHeaders === 'function') {
         console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders with headers:', url, headers);
         player.setSrcWithCustomHeaders(url, headers);
-      } else if (typeof player?.setSrcWithCustomHeaders === 'function') {
-        console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders without headers:', url);
-        player.setSrcWithCustomHeaders(url, null);
       } else {
-        console.info('[VegaPlayer] Setting target.src:', url);
-        target.src = url;
+        // Never call player.setSrcWithCustomHeaders(url, null) because Vega W3CMedia IDL
+        // throws InvalidInputError on null headers and aborts the GStreamer pipeline.
+        if (target.src !== url) {
+          console.info('[VegaPlayer] Setting target.src:', url);
+          target.src = url;
+        } else {
+          console.info('[VegaPlayer] target.src matches, keeping pipeline intact:', url);
+        }
       }
     } catch (err) {
       console.warn('[VegaPlayer] setVideoSource error:', err);
@@ -83,7 +89,12 @@ export const App = () => {
   }, []);
 
   React.useEffect(() => {
-    if (videoUrl && videoRef.current) {
+    const hasHeaders = Boolean(
+      customHeadersRef.current &&
+      typeof customHeadersRef.current === 'object' &&
+      Object.keys(customHeadersRef.current).length > 0,
+    );
+    if (videoUrl && videoRef.current && hasHeaders) {
       setVideoSource(videoUrl, customHeadersRef.current);
     }
   }, [videoUrl, setVideoSource]);
@@ -166,7 +177,7 @@ export const App = () => {
                 setCustomHeaders(headers);
                 appliedSrcRef.current = null;
                 setVideoUrl(payload.url);
-                if (videoRef.current) {
+                if (videoRef.current && headers) {
                   setVideoSource(payload.url, headers);
                 }
               }
@@ -174,23 +185,27 @@ export const App = () => {
             case 'setHeaders':
               if (payload.headers && typeof payload.headers === 'object') {
                 const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
-                customHeadersRef.current = merged;
-                setCustomHeaders(merged);
-                appliedSrcRef.current = null;
-                if (videoUrl) {
-                  setVideoSource(videoUrl, merged);
+                if (Object.keys(merged).length > 0) {
+                  customHeadersRef.current = merged;
+                  setCustomHeaders(merged);
+                  appliedSrcRef.current = null;
+                  if (videoUrl) {
+                    setVideoSource(videoUrl, merged);
+                  }
                 }
               }
               break;
             case 'prepare':
               if (payload.headers && typeof payload.headers === 'object') {
                 const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
-                customHeadersRef.current = merged;
-                setCustomHeaders(merged);
-                appliedSrcRef.current = null;
-                const targetUrl = payload.url || videoUrl;
-                if (targetUrl) {
-                  setVideoSource(targetUrl, merged);
+                if (Object.keys(merged).length > 0) {
+                  customHeadersRef.current = merged;
+                  setCustomHeaders(merged);
+                  appliedSrcRef.current = null;
+                  const targetUrl = payload.url || videoUrl;
+                  if (targetUrl) {
+                    setVideoSource(targetUrl, merged);
+                  }
                 }
               }
               if (
@@ -360,9 +375,15 @@ export const App = () => {
             scalingmode="fit"
             onComponentDidMount={() => {
               console.info('[VegaPlayer] onComponentDidMount fired for:', videoUrl);
-              appliedSrcRef.current = null;
-              if (videoUrl) {
+              const hasHeaders = Boolean(
+                customHeadersRef.current &&
+                typeof customHeadersRef.current === 'object' &&
+                Object.keys(customHeadersRef.current).length > 0
+              );
+              if (videoUrl && hasHeaders) {
                 setVideoSource(videoUrl, customHeadersRef.current);
+              } else if (videoUrl) {
+                appliedSrcRef.current = { url: videoUrl, headersStr: '' };
               }
             }}
             onCanPlay={() => {

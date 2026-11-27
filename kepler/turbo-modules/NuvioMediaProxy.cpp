@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -28,11 +29,16 @@
 #include <utility>
 #include <vector>
 
+extern char **environ;
+
 namespace nuviomediaproxyTurboModule {
 
 namespace {
 
 using com::amazon::kepler::turbomodule::JSObject;
+
+constexpr const char* FFPROBE_BIN = "/usr/bin/ffprobe";
+constexpr const char* FFMPEG_BIN = "/usr/bin/ffmpeg";
 
 constexpr long long PRESERVE_HEAD_BYTES = 256LL * 1024 * 1024;
 constexpr long long KEEP_BEHIND_BYTES = 128LL * 1024 * 1024;
@@ -108,6 +114,52 @@ std::vector<char*> argvPointers(std::vector<std::string>& argv) {
 }
 
 /**
+ * The Kepler app process exports an LD_LIBRARY_PATH pointing at its private
+ * libraries. System ffmpeg/ffprobe must not inherit it: on Vega that makes the
+ * loader pick an incompatible libavutil and ffprobe dies with
+ * `undefined symbol: av_hash_alloc, version LIBAVUTIL_56`.
+ */
+std::vector<std::string> sanitizedEnvironment() {
+  std::vector<std::string> environment;
+  bool hasPath = false;
+  for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+    const std::string item = *entry;
+    if (item.rfind("LD_LIBRARY_PATH=", 0) == 0 || item.rfind("LD_PRELOAD=", 0) == 0 ||
+        item.rfind("LD_AUDIT=", 0) == 0) {
+      continue;
+    }
+    if (item.rfind("PATH=", 0) == 0) {
+      hasPath = true;
+      environment.push_back("PATH=/usr/bin:/bin");
+    } else {
+      environment.push_back(item);
+    }
+  }
+  if (!hasPath) {
+    environment.push_back("PATH=/usr/bin:/bin");
+  }
+  environment.push_back("LD_LIBRARY_PATH=/usr/lib:/lib");
+  return environment;
+}
+
+void execChild(const std::vector<std::string>& argv) {
+  auto pointers = argvPointers(const_cast<std::vector<std::string>&>(argv));
+  auto environment = sanitizedEnvironment();
+  std::vector<char*> environmentPointers;
+  environmentPointers.reserve(environment.size() + 1);
+  for (auto& item : environment) {
+    environmentPointers.push_back(const_cast<char*>(item.c_str()));
+  }
+  environmentPointers.push_back(nullptr);
+
+  execve(pointers[0], pointers.data(), environmentPointers.data());
+  const std::string message =
+      std::string("execve failed for ") + argv[0] + ": " + strerror(errno) + "\n";
+  write(STDERR_FILENO, message.data(), message.size());
+  _exit(127);
+}
+
+/**
  * Runs a child process and captures both streams. ffprobe writes its real
  * failure reason (HTTP status, protocol error, etc.) to stderr, so hiding it
  * would leave the app with only "ffprobe failed for media source".
@@ -148,9 +200,7 @@ int runCapture(
       dup2(devNull, STDIN_FILENO);
       close(devNull);
     }
-    auto pointers = argvPointers(const_cast<std::vector<std::string>&>(argv));
-    execvp(pointers[0], pointers.data());
-    _exit(127);
+    execChild(argv);
   }
 
   close(outPipe[1]);
@@ -257,7 +307,7 @@ void selectTracks(
   estimatedTotalBytes = sourceTotalBytes;
 
   std::vector<std::string> probeArgv = {
-      "ffprobe", "-v", "error", "-show_entries",
+      FFPROBE_BIN, "-v", "error", "-show_entries",
       "stream=index,codec_name,codec_type,bit_rate:format=bit_rate,size",
       "-of", "csv=p=0"};
   if (!headers.empty()) {
@@ -803,7 +853,7 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   session->estimatedTotalBytes = estimatedTotalBytes;
 
   std::vector<std::string> ffmpegArgv = {
-      "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"};
+      FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"};
   if (!headers.empty()) {
     ffmpegArgv.push_back("-headers");
     ffmpegArgv.push_back(headers);
@@ -860,9 +910,7 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
       dup2(log, STDERR_FILENO);
       close(log);
     }
-    auto pointers = argvPointers(ffmpegArgv);
-    execvp(pointers[0], pointers.data());
-    _exit(127);
+    execChild(ffmpegArgv);
   }
   session->ffmpegPid = pid;
 

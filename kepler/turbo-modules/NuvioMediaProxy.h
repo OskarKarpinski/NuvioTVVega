@@ -16,6 +16,7 @@ public:
   ~NuvioMediaProxy() noexcept;
 
   com::amazon::kepler::turbomodule::JSObject startProxy(com::amazon::kepler::turbomodule::JSObject config) override;
+  com::amazon::kepler::turbomodule::JSObject preparePlayback(com::amazon::kepler::turbomodule::JSObject config) override;
   bool stopProxy(std::string sessionId) override;
   com::amazon::kepler::turbomodule::JSObject proxyStatus(std::string sessionId) override;
   std::string readProxyLog(std::string sessionId) override;

@@ -19,6 +19,7 @@ NuvioMediaProxySpec::~NuvioMediaProxySpec() = default;
 
 void NuvioMediaProxySpec::aggregateMethods(MethodAggregator<KeplerTurboModule>& methodAggregator) const noexcept {
   methodAggregator.addMethod("startProxy", &NuvioMediaProxySpec::startProxy);
+  methodAggregator.addMethod("preparePlayback", &NuvioMediaProxySpec::preparePlayback);
   methodAggregator.addMethod("stopProxy", &NuvioMediaProxySpec::stopProxy);
   methodAggregator.addMethod("proxyStatus", &NuvioMediaProxySpec::proxyStatus);
   methodAggregator.addMethod("readProxyLog", &NuvioMediaProxySpec::readProxyLog);

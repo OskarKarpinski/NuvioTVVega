@@ -46,32 +46,59 @@ constexpr const char* FFMPEG_BINARY = "libnuvioffmpeg.so";
 constexpr const char* LOADER_BINARY = "ld-linux-armhf.so.3";
 constexpr const char* SELF_TEST_PATH = "/tmp/nuvio-selftest.log";
 
-/** Enough of a Matroska file for the native demuxer to report metadata. */
-constexpr long long MIN_PREROLL_BYTES = 128LL * 1024;
-constexpr std::chrono::milliseconds PREROLL_DEADLINE{4000};
+/** A playback file smaller than this is not safe to hand to the native demuxer. */
+constexpr long long MIN_PLAYBACK_BYTES = 128LL * 1024;
 constexpr long long LOG_TAIL_BYTES = 8 * 1024;
 
 struct ProxySession {
   std::string id;
   std::string url;
   std::string headers;
+  /** Stage 2 output: the only path ever given to the native player. */
   std::string cachePath;
   std::string logPath;
   std::string localUrl;
+
+  /** Stage 1: one complete, seekable master MKV downloaded from the URL. */
+  std::string masterPath;
+  std::string masterTmpPath;
+  std::string masterLogPath;
+  bool masterComplete = false;
+  bool masterDone = false;
+  int masterExitCode = 0;
+  pid_t masterPid = -1;
+  std::thread masterMonitorThread;
+  size_t masterLogOffset = 0;
+
+  /** Stage 2: local-only remux of the master into a complete playback file. */
+  std::string playbackTmpPath;
+  std::string playbackLogPath;
+  bool playbackReady = false;
+  bool playbackAttempted = false;
+  bool playbackDone = false;
+  int playbackExitCode = 0;
+  int playbackGeneration = 0;
+  int playbackInFlightGeneration = 0;
+  int playbackRequestedGeneration = 0;
+  std::string playbackDiagnostic;
+  pid_t playbackPid = -1;
+  std::thread playbackMonitorThread;
+  size_t playbackLogOffset = 0;
+
   double startTimeSec = 0;
   int audioTrackIndex = -1;
   int audioTrackCount = 0;
-  pid_t ffmpegPid = -1;
+  int discoveredAudioCount = 0;
   bool stopping = false;
-  bool ready = false;
-  bool ffmpegDone = false;
-  int ffmpegExitCode = 0;
   std::string error;
-  /** JSON array of audio streams discovered from ffmpeg's input stream list. */
+  /** JSON array of audio streams discovered from the master's stream list. */
   std::string audioTracksJson = "[]";
+  std::vector<std::string> tempFiles;
+
   std::mutex mutex;
+  /** Serializes process teardown/launch; never held while joining a thread. */
+  std::mutex transitionMutex;
   std::condition_variable cv;
-  std::thread monitorThread;
 };
 
 std::mutex gSessionsMutex;
@@ -500,8 +527,8 @@ std::string readTail(const std::string& path, size_t maxBytes) {
   return text;
 }
 
-std::string ffmpegFailure(const std::shared_ptr<ProxySession>& session, int exitCode) {
-  const std::string log = trim(readTail(session->logPath, LOG_TAIL_BYTES));
+std::string ffmpegFailure(const std::string& logPath, int exitCode) {
+  const std::string log = trim(readTail(logPath, LOG_TAIL_BYTES));
   std::string reason = "ffmpeg exited with code " + std::to_string(exitCode);
 
   std::vector<std::string> lines;
@@ -561,46 +588,211 @@ std::string ffmpegFailure(const std::shared_ptr<ProxySession>& session, int exit
   return reason;
 }
 
-void monitorProcess(const std::shared_ptr<ProxySession>& session) {
-  int status = 0;
-  pid_t result = -1;
-  do {
-    result = waitpid(session->ffmpegPid, &status, 0);
-  } while (result < 0 && errno == EINTR);
+std::string readSelfTest() {
+  std::ifstream report(SELF_TEST_PATH);
+  if (!report) {
+    return std::string("missing");
+  }
+  return std::string{std::istreambuf_iterator<char>(report),
+                     std::istreambuf_iterator<char>()};
+}
 
-  const int exitCode = result > 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  {
-    std::lock_guard<std::mutex> lock(session->mutex);
-    session->ffmpegDone = true;
-    session->ffmpegExitCode = exitCode;
-    if (exitCode != 0 && session->error.empty()) {
-      session->error = ffmpegFailure(session, exitCode);
+void appendBytesToFile(const std::string& path, const std::string& data) {
+  if (data.empty()) {
+    return;
+  }
+  const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd < 0) {
+    return;
+  }
+  size_t written = 0;
+  while (written < data.size()) {
+    const ssize_t count =
+        write(fd, data.data() + written, data.size() - written);
+    if (count > 0) {
+      written += static_cast<size_t>(count);
+    } else if (count < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
     }
   }
-  session->cv.notify_all();
+  close(fd);
+}
+
+/** Mirrors newly written stage logs into the single logPath exposed to JS. */
+void appendLogUpdatesLocked(const std::shared_ptr<ProxySession>& session) {
+  const auto append = [&](const std::string& path, size_t& offset) {
+    const long long size = fileSize(path);
+    if (size < 0) {
+      return;
+    }
+    if (static_cast<long long>(offset) > size) {
+      offset = 0;
+    }
+    if (size <= static_cast<long long>(offset)) {
+      return;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      return;
+    }
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    std::string chunk(static_cast<size_t>(size) - offset, '\0');
+    input.read(&chunk[0], static_cast<std::streamsize>(chunk.size()));
+    chunk.resize(static_cast<size_t>(input.gcount()));
+    if (!chunk.empty()) {
+      appendBytesToFile(session->logPath, chunk);
+    }
+    offset = static_cast<size_t>(size);
+  };
+  append(session->masterLogPath, session->masterLogOffset);
+  append(session->playbackLogPath, session->playbackLogOffset);
+}
+
+/** Combined tail: stage 1 diagnostics first, then the newest stage 2 output. */
+std::string combinedLogTailLocked(const std::shared_ptr<ProxySession>& session) {
+  appendLogUpdatesLocked(session);
+  const std::string master = trim(readTail(session->masterLogPath, LOG_TAIL_BYTES / 2));
+  const std::string playback = trim(readTail(session->playbackLogPath, LOG_TAIL_BYTES / 2));
+  if (master.empty()) {
+    return playback;
+  }
+  if (playback.empty()) {
+    return master;
+  }
+  return "master: " + master + "\nplayback: " + playback;
+}
+
+std::string currentPhaseLocked(const std::shared_ptr<ProxySession>& session) {
+  if (!session->error.empty()) {
+    return "error";
+  }
+  if (session->playbackAttempted && !session->playbackDone) {
+    return "remuxing";
+  }
+  if (session->playbackReady) {
+    return "ready";
+  }
+  return "preparing";
+}
+
+/** Builds every field shared by startProxy, preparePlayback and proxyStatus. */
+JSObject statusLocked(const std::shared_ptr<ProxySession>& session) {
+  JSObject result;
+  const std::string phase = currentPhaseLocked(session);
+  result["localUrl"] = session->localUrl;
+  result["cachePath"] = session->cachePath;
+  result["logPath"] = session->logPath;
+  result["state"] = phase;
+  result["phase"] = phase;
+  result["bytesWritten"] =
+      static_cast<double>(session->playbackReady
+                              ? std::max<long long>(fileSize(session->cachePath), 0)
+                              : 0);
+  result["masterBytes"] = static_cast<double>(std::max<long long>(
+      std::max(fileSize(session->masterPath), fileSize(session->masterTmpPath)), 0));
+  result["masterComplete"] = static_cast<double>(session->masterComplete ? 1 : 0);
+  result["masterExitCode"] = static_cast<double>(session->masterExitCode);
+  result["playbackExitCode"] = static_cast<double>(session->playbackExitCode);
+  // The last attempted stage is the meaningful one for callers.
+  result["exitCode"] = static_cast<double>(
+      session->playbackAttempted ? session->playbackExitCode : session->masterExitCode);
+  result["error"] = session->error;
+  result["log"] = combinedLogTailLocked(session);
+  result["audioTracks"] = session->audioTracksJson;
+  result["selfTest"] = readSelfTest();
+  result["playbackGeneration"] = static_cast<double>(session->playbackGeneration);
+  result["playbackInFlightGeneration"] =
+      static_cast<double>(session->playbackInFlightGeneration);
+  result["playbackDone"] = static_cast<double>(session->playbackDone ? 1 : 0);
+  result["playbackReady"] = static_cast<double>(session->playbackReady ? 1 : 0);
+  result["playbackDiagnostic"] = session->playbackDiagnostic;
+  return result;
+}
+
+JSObject statusObject(const std::shared_ptr<ProxySession>& session) {
+  std::lock_guard<std::mutex> lock(session->mutex);
+  return statusLocked(session);
+}
+
+JSObject baseResult(const std::string& state) {
+  JSObject result;
+  result["localUrl"] = std::string("");
+  result["cachePath"] = std::string("");
+  result["logPath"] = std::string("");
+  result["state"] = state;
+  result["phase"] = state;
+  result["bytesWritten"] = 0.0;
+  result["masterBytes"] = 0.0;
+  result["masterComplete"] = 0.0;
+  result["masterExitCode"] = 0.0;
+  result["playbackExitCode"] = 0.0;
+  result["exitCode"] = 0.0;
+  result["error"] = std::string("");
+  result["log"] = std::string("");
+  result["audioTracks"] = std::string("[]");
+  result["selfTest"] = readSelfTest();
+  result["playbackGeneration"] = 0.0;
+  result["playbackInFlightGeneration"] = 0.0;
+  result["playbackDone"] = 0.0;
+  result["playbackReady"] = 0.0;
+  result["playbackDiagnostic"] = std::string("");
+  return result;
+}
+
+JSObject errorResult(const std::string& message) {
+  JSObject result = baseResult("error");
+  result["error"] = message;
+  return result;
 }
 
 /**
- * Builds the remux command. There is deliberately no codec allow-list: every
- * audio stream is normalized to Opus, a format the Vega pipeline decodes in
- * software, so playback never depends on guessing what the player supports.
- * Video and subtitles are copied without re-encoding.
+ * Launches one bundled ffmpeg stage. The output file is created by us before
+ * exec so a crash cannot leave a partial file at a path the player will read.
  */
-std::vector<std::string> buildCommand(const std::shared_ptr<ProxySession>& session) {
-  const std::string binary = bundledPath(FFMPEG_BINARY);
+pid_t launchStage(const std::vector<std::string>& argv,
+                  const std::string& stdoutPath,
+                  const std::string& stderrPath) {
+  const pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    int input = open("/dev/null", O_RDONLY);
+    if (input >= 0) {
+      dup2(input, STDIN_FILENO);
+      close(input);
+    }
+    int output = open(stdoutPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (output >= 0) {
+      dup2(output, STDOUT_FILENO);
+      close(output);
+    }
+    int log = open(stderrPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log >= 0) {
+      dup2(log, STDERR_FILENO);
+      close(log);
+    }
+    execChild(argv);
+  }
+  return pid;
+}
+
+/**
+ * Stage 1 downloads and normalizes the remote source exactly once. There is no
+ * -ss and no HTTP range seeking: ffmpeg must produce a complete, seekable MKV
+ * before stage 2 is allowed to touch it.
+ */
+std::vector<std::string> buildMasterCommand(const std::shared_ptr<ProxySession>& session) {
   // Info level is needed once: ffmpeg prints the input stream languages/titles
   // before remuxing. -nostats keeps that diagnostic log free of progress spam.
   std::vector<std::string> argv = {
-      binary, "-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-y"};
+      bundledPath(FFMPEG_BINARY), "-hide_banner", "-loglevel", "info",
+      "-nostats", "-nostdin", "-y"};
   if (!session->headers.empty()) {
     argv.push_back("-headers");
     argv.push_back(session->headers);
-  }
-  if (session->startTimeSec > 0) {
-    std::ostringstream startText;
-    startText << std::fixed << session->startTimeSec;
-    argv.push_back("-ss");
-    argv.push_back(startText.str());
   }
   argv.push_back("-i");
   argv.push_back(session->url);
@@ -610,6 +802,8 @@ std::vector<std::string> buildCommand(const std::shared_ptr<ProxySession>& sessi
   argv.push_back("0:a?");
   argv.push_back("-map");
   argv.push_back("0:s?");
+  // Every audio stream becomes Opus, a format Vega decodes in software, so
+  // playback never depends on guessing what the platform supports.
   argv.push_back("-c:v");
   argv.push_back("copy");
   argv.push_back("-c:a");
@@ -620,52 +814,263 @@ std::vector<std::string> buildCommand(const std::shared_ptr<ProxySession>& sessi
   argv.push_back("2");
   argv.push_back("-c:s");
   argv.push_back("copy");
-  // Exactly one audio track must be default. Sources with several default
-  // tracks make Vega's pipeline reconfigure itself in a loop and abort pending
-  // reconfigurations. The native player honours FlagDefault even when its
-  // runtime enable/disable API is unreliable, so this also makes audio
-  // switching survive the remux for every source.
-  argv.push_back("-disposition:a");
-  argv.push_back("0");
-  const int selectedAudio =
-      session->audioTrackIndex >= 0 && session->audioTrackIndex < session->audioTrackCount
-          ? session->audioTrackIndex
-          : 0;
-  std::ostringstream defaultSpecifier;
-  defaultSpecifier << "-disposition:a:" << selectedAudio;
-  argv.push_back(defaultSpecifier.str());
-  argv.push_back("default");
-  // A SeekHead/Cues index would point at the end of a still-growing file; the
-  // native demuxer would request those ranges before preroll and give up.
-  argv.push_back("-write_index");
-  argv.push_back("0");
   argv.push_back("-f");
   argv.push_back("matroska");
-  argv.push_back("pipe:1");
+  argv.push_back(session->masterTmpPath);
   return argv;
 }
 
-/** Waits until a readable MKV prefix exists or the remux has stopped. */
-bool waitForPreroll(const std::shared_ptr<ProxySession>& session) {
-  const auto deadline = std::chrono::steady_clock::now() + PREROLL_DEADLINE;
-  while (std::chrono::steady_clock::now() < deadline) {
-    const long long size = fileSize(session->cachePath);
-    if (size >= MIN_PREROLL_BYTES) {
-      return true;
+/**
+ * Stage 2 only reads the completed local master. -ss before -i lets ffmpeg seek
+ * in that local file, and the dispositions leave exactly one default audio
+ * track so Vega does not reconfigure its pipeline in a loop.
+ */
+std::vector<std::string> buildPlaybackCommand(const std::shared_ptr<ProxySession>& session,
+                                              double startTimeSec,
+                                              int audioTrackIndex,
+                                              int audioTrackCount,
+                                              const std::string& outputPath) {
+  std::vector<std::string> argv = {
+      bundledPath(FFMPEG_BINARY), "-hide_banner", "-loglevel", "info",
+      "-nostats", "-nostdin", "-y"};
+  std::ostringstream startText;
+  startText << std::fixed << std::max<double>(0, startTimeSec);
+  argv.push_back("-ss");
+  argv.push_back(startText.str());
+  argv.push_back("-i");
+  argv.push_back(session->masterPath);
+  argv.push_back("-map");
+  argv.push_back("0:v:0");
+  argv.push_back("-map");
+  argv.push_back("0:a?");
+  argv.push_back("-map");
+  argv.push_back("0:s?");
+  argv.push_back("-c");
+  argv.push_back("copy");
+  // The master's own stream list wins over the caller's hint when present.
+  const int effectiveCount = session->discoveredAudioCount > 0
+                                 ? session->discoveredAudioCount
+                                 : audioTrackCount;
+  if (effectiveCount > 0) {
+    int selected = 0;
+    if (audioTrackIndex >= 0) {
+      selected = std::min(audioTrackIndex, effectiveCount - 1);
     }
-    bool stopped = false;
-    bool done = false;
-    {
-      std::lock_guard<std::mutex> lock(session->mutex);
-      stopped = session->stopping;
-      done = session->ffmpegDone;
-    }
-    if (stopped || done) {
+    argv.push_back("-disposition:a");
+    argv.push_back("0");
+    std::ostringstream defaultSpecifier;
+    defaultSpecifier << "-disposition:a:" << selected;
+    argv.push_back(defaultSpecifier.str());
+    argv.push_back("default");
+  }
+  argv.push_back("-f");
+  argv.push_back("matroska");
+  argv.push_back(outputPath);
+  return argv;
+}
+
+void monitorProcess(const std::shared_ptr<ProxySession>& session,
+                    pid_t pid,
+                    bool masterStage,
+                    int generation);
+
+void stopPlaybackProcess(const std::shared_ptr<ProxySession>& session) {
+  pid_t pid = -1;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    pid = session->playbackPid;
+    session->playbackPid = -1;
+  }
+  if (pid > 0 && pid != getpid()) {
+    kill(pid, SIGTERM);
+  }
+  if (session->playbackMonitorThread.joinable() &&
+      session->playbackMonitorThread.get_id() != std::this_thread::get_id()) {
+    session->playbackMonitorThread.join();
+  }
+}
+
+/** Starts (or restarts) the local-only stage 2, never touching the network. */
+bool beginPlayback(const std::shared_ptr<ProxySession>& session,
+                   double startTimeSec,
+                   int audioTrackIndex,
+                   int audioTrackCount,
+                   int generation) {
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->stopping || !session->masterComplete || !session->error.empty() ||
+        generation < session->playbackRequestedGeneration) {
       return false;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    session->playbackRequestedGeneration = generation;
   }
-  return false;
+
+  std::lock_guard<std::mutex> transition(session->transitionMutex);
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->stopping || !session->masterComplete) {
+      return false;
+    }
+  }
+  // A previous remux must be gone before its output path can be replaced.
+  stopPlaybackProcess(session);
+
+  const std::string idPart = safeSessionId(session->id);
+  const std::string tmpPath = "/tmp/nuvio-proxy-" + idPart +
+                              "-playback-" + std::to_string(generation) + ".tmp.mkv";
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->stopping) {
+      return false;
+    }
+    unlink(tmpPath.c_str());
+    session->playbackTmpPath = tmpPath;
+    session->tempFiles.push_back(tmpPath);
+    session->playbackInFlightGeneration = generation;
+    session->playbackAttempted = true;
+    session->playbackDone = false;
+    session->playbackExitCode = 0;
+    session->playbackDiagnostic.clear();
+  }
+
+  const std::vector<std::string> argv = buildPlaybackCommand(
+      session, startTimeSec, audioTrackIndex, audioTrackCount, tmpPath);
+  const pid_t pid = launchStage(argv, tmpPath, session->playbackLogPath);
+  if (pid < 0) {
+    const std::string error =
+        std::string("Unable to start local remux: ") + strerror(errno);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->playbackDone = true;
+    session->error = error;
+    return false;
+  }
+  bool stopped = false;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->playbackPid = pid;
+    stopped = session->stopping;
+  }
+  if (stopped) {
+    // stopProxy ran between launch and monitor creation: reap the child here.
+    kill(pid, SIGTERM);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->playbackPid = -1;
+    session->playbackDone = true;
+    return false;
+  }
+  session->playbackMonitorThread = std::thread(monitorProcess, session, pid, false, generation);
+  return true;
+}
+
+void monitorProcess(const std::shared_ptr<ProxySession>& session,
+                    pid_t pid,
+                    bool masterStage,
+                    int generation) {
+  int status = 0;
+  pid_t result = -1;
+  do {
+    result = waitpid(pid, &status, 0);
+  } while (result < 0 && errno == EINTR);
+
+  const int exitCode = result > 0 && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+  bool shouldBeginPlayback = false;
+  double startTimeSec = 0;
+  int audioTrackIndex = -1;
+  int audioTrackCount = 0;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (masterStage) {
+      session->masterDone = true;
+      session->masterExitCode = exitCode;
+      if (session->stopping) {
+        session->cv.notify_all();
+        return;
+      }
+      if (exitCode != 0) {
+        session->error = ffmpegFailure(session->masterLogPath, exitCode);
+      } else {
+        const std::vector<AudioTrackMetadata> tracks =
+            parseAudioTracks(readTail(session->masterLogPath, LOG_TAIL_BYTES));
+        session->audioTracksJson = audioTracksToJson(tracks);
+        session->discoveredAudioCount =
+            tracks.empty() ? session->audioTrackCount : static_cast<int>(tracks.size());
+        if (fileSize(session->masterTmpPath) <= 0 ||
+            ::rename(session->masterTmpPath.c_str(), session->masterPath.c_str()) != 0) {
+          session->error = "Master download did not produce a usable MKV";
+        } else {
+          session->masterComplete = true;
+        }
+      }
+      if (session->error.empty()) {
+        shouldBeginPlayback = true;
+        startTimeSec = session->startTimeSec;
+        audioTrackIndex = session->audioTrackIndex;
+        audioTrackCount = session->audioTrackCount;
+      }
+    } else {
+      session->playbackExitCode = exitCode;
+      if (session->stopping ||
+          generation != session->playbackInFlightGeneration) {
+        // Superseded by a newer preparePlayback: its result is a diagnostic.
+        session->playbackDiagnostic = "Playback generation " +
+                                      std::to_string(generation) +
+                                      " was superseded before completion";
+        session->cv.notify_all();
+        return;
+      }
+      session->playbackDone = true;
+      const std::string tmpPath = session->playbackTmpPath;
+      const long long size = fileSize(tmpPath);
+      if (exitCode == 0 && size >= MIN_PLAYBACK_BYTES) {
+        if (::rename(tmpPath.c_str(), session->cachePath.c_str()) == 0) {
+          session->playbackReady = true;
+          session->playbackGeneration = generation;
+          session->playbackDiagnostic.clear();
+        } else {
+          session->playbackDiagnostic =
+              std::string("Unable to publish playback file: ") + strerror(errno);
+        }
+      } else if (exitCode != 0) {
+        session->playbackDiagnostic = ffmpegFailure(session->playbackLogPath, exitCode);
+      } else {
+        session->playbackDiagnostic =
+            "Local remux produced only " + std::to_string(std::max<long long>(size, 0)) +
+            " bytes (expected at least " + std::to_string(MIN_PLAYBACK_BYTES) + ")";
+      }
+      // A failed local remux is recoverable: an older playback file may still
+      // be playing, and the caller can retry from the local master. Only a
+      // failed master download is a fatal session error.
+    }
+  }
+  session->cv.notify_all();
+
+  // Called outside the mutex: beginPlayback may join the old stage 2 thread.
+  if (shouldBeginPlayback) {
+    beginPlayback(session, startTimeSec, audioTrackIndex, audioTrackCount, 1);
+  }
+}
+
+void cleanupFiles(const std::shared_ptr<ProxySession>& session) {
+  std::vector<std::string> paths;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    paths.push_back(session->cachePath);
+    paths.push_back(session->masterPath);
+    paths.push_back(session->masterTmpPath);
+    paths.push_back(session->masterLogPath);
+    paths.push_back(session->playbackLogPath);
+    paths.push_back(session->logPath);
+    paths.insert(paths.end(), session->tempFiles.begin(), session->tempFiles.end());
+  }
+  for (const auto& path : paths) {
+    if (!path.empty()) {
+      unlink(path.c_str());
+    }
+  }
 }
 
 void stopSession(const std::shared_ptr<ProxySession>& session) {
@@ -674,12 +1079,35 @@ void stopSession(const std::shared_ptr<ProxySession>& session) {
     session->stopping = true;
   }
   session->cv.notify_all();
-  if (session->ffmpegPid > 0) {
-    kill(session->ffmpegPid, SIGTERM);
+
+  pid_t masterPid = -1;
+  pid_t playbackPid = -1;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    masterPid = session->masterPid;
+    playbackPid = session->playbackPid;
+    session->masterPid = -1;
+    session->playbackPid = -1;
   }
-  if (session->monitorThread.joinable()) {
-    session->monitorThread.join();
+  if (masterPid > 0 && masterPid != getpid()) {
+    kill(masterPid, SIGTERM);
   }
+  if (playbackPid > 0 && playbackPid != getpid()) {
+    kill(playbackPid, SIGTERM);
+  }
+  // The master monitor can call beginPlayback; it sees stopping and skips it.
+  if (session->masterMonitorThread.joinable() &&
+      session->masterMonitorThread.get_id() != std::this_thread::get_id()) {
+    session->masterMonitorThread.join();
+  }
+  {
+    std::lock_guard<std::mutex> transition(session->transitionMutex);
+    if (session->playbackMonitorThread.joinable() &&
+        session->playbackMonitorThread.get_id() != std::this_thread::get_id()) {
+      session->playbackMonitorThread.join();
+    }
+  }
+  cleanupFiles(session);
 }
 
 } // namespace
@@ -717,30 +1145,21 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   const double audioTrack = valueOr<double>(config, "audioTrackIndex", -1);
   const double audioTracks = valueOr<double>(config, "audioTrackCount", 0);
 
-  JSObject result;
-  result["localUrl"] = std::string("");
-  result["cachePath"] = std::string("");
-  result["logPath"] = std::string("");
   if (sessionId.empty() || url.empty()) {
-    result["error"] = std::string("Missing sessionId or url");
-    return result;
+    return errorResult("Missing sessionId or url");
   }
 
   {
     std::lock_guard<std::mutex> lock(gSessionsMutex);
     const auto existing = gSessions.find(sessionId);
     if (existing != gSessions.end()) {
-      result["localUrl"] = existing->second->localUrl;
-      result["cachePath"] = existing->second->cachePath;
-      result["logPath"] = existing->second->logPath;
-      return result;
+      return statusObject(existing->second);
     }
   }
 
   const std::string binary = bundledPath(FFMPEG_BINARY);
   if (access(binary.c_str(), X_OK) != 0) {
-    result["error"] = "Bundled ffmpeg is missing or not executable: " + binary;
-    return result;
+    return errorResult("Bundled ffmpeg is missing or not executable: " + binary);
   }
 
   auto session = std::make_shared<ProxySession>();
@@ -752,74 +1171,97 @@ JSObject NuvioMediaProxy::startProxy(JSObject config) {
   session->audioTrackCount = audioTracks > 0 ? static_cast<int>(audioTracks) : 0;
   const std::string idPart = safeSessionId(sessionId);
   session->cachePath = "/tmp/nuvio-proxy-" + idPart + ".mkv";
+  session->localUrl = "file://" + session->cachePath;
   session->logPath = "/tmp/nuvio-proxy-" + idPart + ".log";
-  unlink(session->cachePath.c_str());
-  unlink(session->logPath.c_str());
+  session->masterPath = "/tmp/nuvio-proxy-" + idPart + "-master.mkv";
+  session->masterTmpPath = "/tmp/nuvio-proxy-" + idPart + "-master.tmp.mkv";
+  session->masterLogPath = "/tmp/nuvio-proxy-" + idPart + "-master.log";
+  session->playbackLogPath = "/tmp/nuvio-proxy-" + idPart + "-playback.log";
+  session->tempFiles.push_back(session->masterTmpPath);
 
-  const std::vector<std::string> argv = buildCommand(session);
-  const pid_t pid = fork();
-  if (pid < 0) {
-    result["error"] = "Unable to start bundled ffmpeg: " + std::string(strerror(errno));
-    return result;
-  }
-  if (pid == 0) {
-    int input = open("/dev/null", O_RDONLY);
-    if (input >= 0) {
-      dup2(input, STDIN_FILENO);
-      close(input);
-    }
-    int output =
-        open(session->cachePath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (output >= 0) {
-      dup2(output, STDOUT_FILENO);
-      close(output);
-    }
-    int log = open(session->logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (log >= 0) {
-      dup2(log, STDERR_FILENO);
-      close(log);
-    }
-    execChild(argv);
-  }
+  cleanupFiles(session);
 
-  session->ffmpegPid = pid;
-  session->monitorThread = std::thread(monitorProcess, session);
-
-  if (!waitForPreroll(session)) {
-    std::string error;
-    {
-      std::lock_guard<std::mutex> lock(session->mutex);
-      error = session->ffmpegExitCode == 0
-          ? std::string("ffmpeg produced no playable data within 4 seconds")
-          : ffmpegFailure(session, session->ffmpegExitCode);
-    }
-    stopSession(session);
-    {
-      // stopSession may terminate ffmpeg; keep the original, precise reason.
-      std::lock_guard<std::mutex> lock(session->mutex);
-      session->error = error;
-    }
-    unlink(session->cachePath.c_str());
-    result["error"] = error;
-    return result;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(session->mutex);
-    session->audioTracksJson =
-        audioTracksToJson(parseAudioTracks(readTail(session->logPath, LOG_TAIL_BYTES)));
-    session->ready = true;
-    session->localUrl = "file://" + session->cachePath;
-  }
   {
     std::lock_guard<std::mutex> lock(gSessionsMutex);
     gSessions[sessionId] = session;
   }
 
-  result["localUrl"] = session->localUrl;
-  result["cachePath"] = session->cachePath;
-  result["logPath"] = session->logPath;
-  result["audioTracks"] = session->audioTracksJson;
+  const std::vector<std::string> argv = buildMasterCommand(session);
+  const pid_t pid = launchStage(argv, session->masterTmpPath, session->masterLogPath);
+  if (pid < 0) {
+    const std::string error =
+        std::string("Unable to start bundled ffmpeg: ") + strerror(errno);
+    {
+      std::lock_guard<std::mutex> lock(session->mutex);
+      session->error = error;
+      session->masterDone = true;
+    }
+    return statusObject(session);
+  }
+  bool stopped = false;
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->masterPid = pid;
+    stopped = session->stopping;
+  }
+  if (stopped) {
+    kill(pid, SIGTERM);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->masterPid = -1;
+    session->masterDone = true;
+    return errorResult("Session was stopped");
+  }
+  session->masterMonitorThread = std::thread(monitorProcess, session, pid, true, 0);
+
+  // Return immediately: no preroll wait, no file exposure before completion.
+  return statusObject(session);
+}
+
+JSObject NuvioMediaProxy::preparePlayback(JSObject config) {
+  const std::string sessionId = valueOr<std::string>(config, "sessionId", "");
+  const double startTimeSec = valueOr<double>(config, "startTimeSec", 0);
+  const double audioTrack = valueOr<double>(config, "audioTrackIndex", -1);
+  const double audioTracks = valueOr<double>(config, "audioTrackCount", 0);
+  const double generationValue = valueOr<double>(config, "generation", 1);
+
+  std::shared_ptr<ProxySession> session;
+  {
+    std::lock_guard<std::mutex> lock(gSessionsMutex);
+    const auto it = gSessions.find(sessionId);
+    if (it != gSessions.end()) {
+      session = it->second;
+    }
+  }
+  if (!session) {
+    return errorResult("Unknown sessionId: " + sessionId);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (!session->masterComplete || session->masterExitCode != 0) {
+      JSObject result = statusLocked(session);
+      if (session->error.empty()) {
+        result["error"] = std::string("Local master is not complete yet");
+      }
+      return result;
+    }
+  }
+
+  const int generation = generationValue > 0 ? static_cast<int>(generationValue) : 1;
+  const bool started = beginPlayback(session, startTimeSec,
+                                     audioTrack >= 0 ? static_cast<int>(audioTrack) : -1,
+                                     audioTracks > 0 ? static_cast<int>(audioTracks) : 0,
+                                     generation);
+  JSObject result = statusObject(session);
+  if (!started) {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->error.empty()) {
+      result["error"] = std::string("Unable to start local playback remux");
+    }
+  }
   return result;
 }
 
@@ -835,51 +1277,22 @@ bool NuvioMediaProxy::stopProxy(std::string sessionId) {
     gSessions.erase(it);
   }
   stopSession(session);
-  unlink(session->cachePath.c_str());
-  unlink(session->logPath.c_str());
   return true;
 }
 
 JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
-  JSObject result;
-  result["state"] = std::string("missing");
-  result["bytesWritten"] = 0.0;
-  result["exitCode"] = 0.0;
-  result["error"] = std::string("");
-  result["log"] = std::string("");
-  result["audioTracks"] = std::string("[]");
-  {
-    std::ifstream report(SELF_TEST_PATH);
-    if (report) {
-      result["selfTest"] = std::string{std::istreambuf_iterator<char>(report),
-                                       std::istreambuf_iterator<char>()};
-    } else {
-      result["selfTest"] = std::string("missing");
-    }
-  }
   std::shared_ptr<ProxySession> session;
   {
     std::lock_guard<std::mutex> lock(gSessionsMutex);
     const auto it = gSessions.find(sessionId);
-    if (it == gSessions.end()) {
-      return result;
+    if (it != gSessions.end()) {
+      session = it->second;
     }
-    session = it->second;
   }
-  std::lock_guard<std::mutex> lock(session->mutex);
-  result["state"] = session->ffmpegDone ? std::string("complete") : std::string("streaming");
-  result["bytesWritten"] = static_cast<double>(std::max<long long>(fileSize(session->cachePath), 0));
-  result["exitCode"] = static_cast<double>(session->ffmpegExitCode);
-  result["log"] = trim(readTail(session->logPath, LOG_TAIL_BYTES));
-  result["audioTracks"] = session->audioTracksJson;
-  // Rebuild the message when the monitor observed the exit before ffmpeg had
-  // flushed its last diagnostic line, so errors always carry the real reason.
-  if (session->ffmpegDone && session->ffmpegExitCode != 0 && session->error.empty()) {
-    result["error"] = ffmpegFailure(session, session->ffmpegExitCode);
-  } else {
-    result["error"] = session->error;
+  if (!session) {
+    return baseResult("missing");
   }
-  return result;
+  return statusObject(session);
 }
 
 std::string NuvioMediaProxy::readProxyLog(std::string sessionId) {
@@ -892,7 +1305,8 @@ std::string NuvioMediaProxy::readProxyLog(std::string sessionId) {
     }
     session = it->second;
   }
-  return readTail(session->logPath, LOG_TAIL_BYTES);
+  std::lock_guard<std::mutex> lock(session->mutex);
+  return combinedLogTailLocked(session);
 }
 
 } // namespace nuviomediaproxyTurboModule

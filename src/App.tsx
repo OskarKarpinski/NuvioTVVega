@@ -7,7 +7,9 @@ import {
   usePreventHideSplashScreen,
 } from '@amazon-devices/react-native-kepler';
 import {Video} from '@amazon-devices/react-native-w3cmedia';
-import NuvioMediaProxy from './turbo-modules/nuviomediaproxy';
+import NuvioMediaProxy, {
+  MediaProxyStatus,
+} from './turbo-modules/nuviomediaproxy';
 import {formatProxyHeaders} from './mediaSourceProbe';
 import {
   SslErrorData,
@@ -53,18 +55,18 @@ const INJECTED_PRELOAD_JS = `
 
 const {width: WINDOW_WIDTH, height: WINDOW_HEIGHT} = Dimensions.get('window');
 
-const NATIVE_PREROLL_TIMEOUT_MS = 15000;
+const NATIVE_PREROLL_TIMEOUT_MS = 20000;
+const PROGRESS_STALL_MS = 25000;
+const STATUS_POLL_MS = 100;
+const LOG_POLL_MS = 1500;
 const MAX_NATIVE_LOGS = 40;
 const MAX_PROXY_LOG_CHARS = 8000;
 const WEBVIEW_MAIN_URL = 'file:///pkg/assets/web/index.html';
-// A seek replaces the local file. Give the native pipeline time to open the
-// new src before unlinking the previous one.
+// Keep the previous local file alive until the native pipeline has opened its
+// replacement. Renaming a file that is still open is safe on Linux, but this
+// avoids racing a remount with cleanup.
 const PROXY_RETIRE_DELAY_MS = 8000;
-const AUDIO_TRACK_POLL_MS = 500;
-// GStreamer sees the current end of a still-growing local MKV as EOS. When the
-// remuxer falls behind the player we silently rebuilt a few seconds earlier;
-// cap that recovery so a genuinely broken source still reaches the error UI.
-const MAX_PREMATURE_END_RECOVERIES = 3;
+const MEDIA_ERROR_RETRY_WINDOW_MS = 4000;
 
 type AudioTrackMetadata = {
   index: number;
@@ -74,6 +76,12 @@ type AudioTrackMetadata = {
   sourceChannels: string;
   sampleRate: number;
   default: boolean;
+};
+
+type RebuildOptions = {
+  audioTrackIndex?: number;
+  audioTrackCount?: number;
+  notifySeeked?: boolean;
 };
 
 /**
@@ -93,44 +101,38 @@ export const App = () => {
   const webRef = useRef<any>(null);
   const videoRef = useRef<any>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
-  // Only proxy URLs may reach <Video>. A source is prepared first, then the
-  // native player is mounted with the local URL as its initial src.
   const [sourcePendingToken, setSourcePendingToken] = useState<number>(0);
   const [playbackKey, setPlaybackKey] = useState<number>(0);
-  const customHeadersRef = useRef<Record<string, string> | null>(null);
+  const [showCaptions, setShowCaptions] = useState<boolean>(true);
 
-  // Every source is routed through the on-device remuxer. The native player
-  // only ever sees a local file:// URI, never the remote URL or its headers.
+  // There is exactly one proxy session per source. The remote URL is fetched
+  // once into a complete local master; every seek/audio change rebuilds a
+  // second local file from that master. <Video> only ever sees a finished
+  // file:// MKV, never a growing file and never the remote URL.
   const proxySessionRef = useRef<string | null>(null);
   const lastProxySessionRef = useRef<string | null>(null);
+  const localUrlRef = useRef<string>('');
   const proxyPollRef = useRef<any>(null);
-  const audioTrackPollRef = useRef<any>(null);
   const audioSignatureRef = useRef<string>('');
   const proxyAudioMetadataRef = useRef<AudioTrackMetadata[]>([]);
   const retiredProxyTimersRef = useRef<any[]>([]);
-  const prematureEndCountRef = useRef<number>(0);
   const pendingSeekSecRef = useRef<number | null>(null);
   const proxyLogTailRef = useRef<string>('');
-  const restartProxyAtRef = useRef<
-    (
-      timeSec: number,
-      headersOverride?: Record<string, string> | null,
-      notifySeeked?: boolean,
-      audioTrackIndex?: number,
-      audioTrackCount?: number,
-    ) => Promise<void>
-  >(async () => {});
+  const playbackGenerationRef = useRef<number>(0);
+  const prerollRetryRef = useRef<boolean>(false);
+  const nativeErrorCountRef = useRef<number>(0);
+  const lastNativeErrorAtRef = useRef<number>(0);
+  const lastMountAtRef = useRef<number>(0);
+  const isSwitchingRef = useRef<boolean>(false);
+  const playingRef = useRef<boolean>(false);
 
   const sourceUrlRef = useRef<string>('');
   const sourceHeadersRef = useRef<Record<string, string> | null>(null);
-  // Audio selection is applied by the remuxer, not by trusting the native
-  // player's track enable API: it is authoritative for every source and codec.
   const selectedAudioTrackRef = useRef<number>(-1);
   const audioTrackCountRef = useRef<number>(0);
-  // ffmpeg starts each remux at time 0, so positions reported to the web UI
-  // must be offset by the requested source start time.
+  // ffmpeg resets timestamps to zero for every rebuilt playback file, so all
+  // times reported to the web UI are offset by the requested source position.
   const sourceBaseTimeRef = useRef<number>(0);
-
   const pendingSourceRef = useRef<{
     url: string;
     headers: Record<string, string> | null;
@@ -138,13 +140,8 @@ export const App = () => {
   } | null>(null);
   const sourceGenerationRef = useRef<number>(0);
   const preparingSourceRef = useRef<boolean>(false);
-  const [showCaptions, setShowCaptions] = useState<boolean>(true);
-  const seekTimeoutRef = useRef<any>(null);
   const prerollWatchdogRef = useRef<any>(null);
   const hasPlayedOrCanPlayRef = useRef<boolean>(false);
-  const isSeekingRef = useRef<boolean>(false);
-  const targetSeekSecRef = useRef<number>(0);
-  const targetLocalSecRef = useRef<number>(0);
   const nativeLogsRef = useRef<Array<string>>([]);
   usePreventHideSplashScreen();
   const hideSplashScreenCallback = useHideSplashScreenCallback();
@@ -155,7 +152,9 @@ export const App = () => {
       const rs = target?.readyState ?? '-';
       const ns = target?.networkState ?? '-';
       const ts = new Date().toISOString().slice(11, 23);
-      const entry = `${ts} [${tag}] rs=${rs} ns=${ns}${detail ? ` ${detail}` : ''}`;
+      const entry = `${ts} [${tag}] rs=${rs} ns=${ns}${
+        detail ? ` ${detail}` : ''
+      }`;
       console.info(`[VegaPlayer] ${entry}`);
       const logs = nativeLogsRef.current;
       logs.push(entry);
@@ -163,14 +162,7 @@ export const App = () => {
         logs.splice(0, logs.length - MAX_NATIVE_LOGS);
       }
     } catch (_) {
-      // Ignore logging errors.
-    }
-  }, []);
-
-  const clearPrerollWatchdog = useCallback(() => {
-    if (prerollWatchdogRef.current) {
-      clearTimeout(prerollWatchdogRef.current);
-      prerollWatchdogRef.current = null;
+      // Diagnostics must never break playback.
     }
   }, []);
 
@@ -196,37 +188,32 @@ export const App = () => {
     }
   }, []);
 
-  const stopAudioTrackPolling = useCallback(() => {
-    if (audioTrackPollRef.current) {
-      clearInterval(audioTrackPollRef.current);
-      audioTrackPollRef.current = null;
-    }
-  }, []);
-
-  const stopProxyPlayback = useCallback((delayMs: number = 0) => {
-    stopProxyPolling();
-    stopAudioTrackPolling();
-    const sessionId = proxySessionRef.current;
-    proxySessionRef.current = null;
-    if (sessionId) {
-      captureProxyLog();
-      lastProxySessionRef.current = sessionId;
-      pushNativeLog('proxy_stopped', `session=${sessionId} delay=${delayMs}`);
-      const retire = () => {
-        try {
-          NuvioMediaProxy.stopProxy(sessionId);
-        } catch (err: any) {
-          console.warn('[VegaPlayer] stopProxy failed:', err);
+  const stopProxyPlayback = useCallback(
+    (delayMs: number = 0) => {
+      stopProxyPolling();
+      const sessionId = proxySessionRef.current;
+      proxySessionRef.current = null;
+      if (sessionId) {
+        captureProxyLog();
+        lastProxySessionRef.current = sessionId;
+        pushNativeLog('proxy_stopped', `session=${sessionId} delay=${delayMs}`);
+        const retire = () => {
+          try {
+            NuvioMediaProxy.stopProxy(sessionId);
+          } catch (err: any) {
+            console.warn('[VegaPlayer] stopProxy failed:', err);
+          }
+        };
+        if (delayMs > 0) {
+          const timer = setTimeout(retire, delayMs);
+          retiredProxyTimersRef.current.push(timer);
+        } else {
+          retire();
         }
-      };
-      if (delayMs > 0) {
-        const timer = setTimeout(retire, delayMs);
-        retiredProxyTimersRef.current.push(timer);
-      } else {
-        retire();
       }
-    }
-  }, [captureProxyLog, pushNativeLog, stopProxyPolling, stopAudioTrackPolling]);
+    },
+    [captureProxyLog, pushNativeLog, stopProxyPolling],
+  );
 
   const sendEventToWeb = useCallback((eventObj: any) => {
     try {
@@ -257,13 +244,14 @@ export const App = () => {
     try {
       const list = videoRef.current?.audioTracks;
       const metadata = proxyAudioMetadataRef.current;
-      const nativeCount = list && typeof list.length === 'number' ? list.length : 0;
+      const nativeCount =
+        list && typeof list.length === 'number' ? list.length : 0;
       const count = Math.max(nativeCount, metadata.length);
       const requested =
         typeof selectedIndex === 'number' && selectedIndex >= 0
           ? selectedIndex
           : selectedAudioTrackRef.current;
-      const defaultIndex = metadata.find(item => item.default)?.index ?? -1;
+      const defaultIndex = metadata.find((item) => item.default)?.index ?? -1;
       for (let i = 0; i < count; i++) {
         const item = nativeCount > 0 ? list[i] : null;
         const meta = metadata[i];
@@ -274,13 +262,18 @@ export const App = () => {
           requested >= 0
             ? i === requested
             : defaultIndex >= 0
-              ? i === defaultIndex
-              : Boolean(item?.enabled);
+            ? i === defaultIndex
+            : Boolean(item?.enabled);
         tracks.push({
           index: i,
           id: item?.id || String(i),
           kind: item?.kind || 'main',
-          label: meta?.title || item?.label || meta?.language || item?.language || `Track ${i + 1}`,
+          label:
+            meta?.title ||
+            item?.label ||
+            meta?.language ||
+            item?.language ||
+            `Track ${i + 1}`,
           language: meta?.language || item?.language || 'und',
           enabled,
           title: meta?.title || item?.label || '',
@@ -297,7 +290,12 @@ export const App = () => {
   }, []);
 
   const extractTextTracks = useCallback(() => {
-    const tracks: Array<{index: number; label: string; language: string; mode: string}> = [];
+    const tracks: Array<{
+      index: number;
+      label: string;
+      language: string;
+      mode: string;
+    }> = [];
     try {
       const list = videoRef.current?.textTracks;
       if (list && typeof list.length === 'number') {
@@ -329,13 +327,15 @@ export const App = () => {
         return;
       }
       const metadata: AudioTrackMetadata[] = parsed
-        .filter(item => item && typeof item.index === 'number')
+        .filter((item) => item && typeof item.index === 'number')
         .map((item: any, ordinal: number) => ({
           index: Number.isFinite(item.index) ? item.index : ordinal,
           language: typeof item.language === 'string' ? item.language : '',
           title: typeof item.title === 'string' ? item.title : '',
-          sourceCodec: typeof item.sourceCodec === 'string' ? item.sourceCodec : '',
-          sourceChannels: typeof item.sourceChannels === 'string' ? item.sourceChannels : '',
+          sourceCodec:
+            typeof item.sourceCodec === 'string' ? item.sourceCodec : '',
+          sourceChannels:
+            typeof item.sourceChannels === 'string' ? item.sourceChannels : '',
           sampleRate: Number(item.sampleRate) || 0,
           default: Boolean(item.default),
         }));
@@ -361,39 +361,16 @@ export const App = () => {
     });
   }, [extractAudioTracks, extractTextTracks, sendEventToWeb]);
 
-  const startAudioTrackPolling = useCallback(
-    (sessionId: string, generation: number) => {
-      stopAudioTrackPolling();
-      audioSignatureRef.current = '';
-      let attempts = 0;
-      audioTrackPollRef.current = setInterval(() => {
-        attempts += 1;
-        if (
-          generation !== sourceGenerationRef.current ||
-          sessionId !== proxySessionRef.current
-        ) {
-          stopAudioTrackPolling();
-          return;
-        }
-        try {
-          readAudioMetadata(NuvioMediaProxy.proxyStatus(sessionId)?.audioTracks);
-        } catch (err) {
-          console.warn('[VegaPlayer] audio track status failed:', err);
-        }
-        sendAudioTracks();
-        if (attempts >= 40 || proxyAudioMetadataRef.current.length > 0) {
-          stopAudioTrackPolling();
-        }
-      }, AUDIO_TRACK_POLL_MS);
-    },
-    [readAudioMetadata, sendAudioTracks, stopAudioTrackPolling],
-  );
-
+  /** Only unrecoverable failures reach the web player's error screen. */
   const forwardNativeError = useCallback(
-    (reason: string, message: string, code: number = 4, extra: Record<string, any> = {}) => {
+    (
+      reason: string,
+      message: string,
+      code: number = 4,
+      extra: Record<string, any> = {},
+    ) => {
       const target = videoRef.current;
-      const diagnosticLogs = [...nativeLogsRef.current];
-      pushNativeLog('forwardError', `${reason}: ${message}`);
+      pushNativeLog('fatalError', `${reason}: ${message}`);
       sendEventToWeb({
         name: 'error',
         error: message,
@@ -407,7 +384,7 @@ export const App = () => {
           duration: target?.duration ?? 0,
           audioTracks: extractAudioTracks(),
           textTracks: extractTextTracks(),
-          diagnosticLogs,
+          diagnosticLogs: [...nativeLogsRef.current],
           proxyLog: proxyLogTailRef.current,
           sourceUrl: sourceUrlRef.current,
           ...extra,
@@ -417,13 +394,18 @@ export const App = () => {
     [extractAudioTracks, extractTextTracks, pushNativeLog, sendEventToWeb],
   );
 
-  const reportNativeActionFailure = useCallback(
+  /**
+   * Play/pause/rate and metadata calls are best-effort control messages. A TV
+   * WebView often throws when the native player is between states; that alone
+   * does not make the movie unwatchable, so it is logged but never escalated.
+   */
+  const logControlFailure = useCallback(
     (action: string, err: any) => {
-      const message = err?.message || err?.name || String(err || `${action} failed`);
-      console.warn(`[VegaPlayer] ${action} failed:`, err);
-      forwardNativeError('native-action-failure', `${action}: ${message}`, 4, {action});
+      const message =
+        err?.message || err?.name || String(err || `${action} failed`);
+      pushNativeLog('control_skipped', `${action}: ${message}`);
     },
-    [forwardNativeError],
+    [pushNativeLog],
   );
 
   const reportedTime = useCallback(() => {
@@ -441,6 +423,113 @@ export const App = () => {
     return sourceBaseTimeRef.current + value;
   }, []);
 
+  const clearPrerollWatchdog = useCallback(() => {
+    if (prerollWatchdogRef.current) {
+      clearTimeout(prerollWatchdogRef.current);
+      prerollWatchdogRef.current = null;
+    }
+  }, []);
+
+  const readStatus = useCallback(
+    (sessionId: string): MediaProxyStatus | null => {
+      try {
+        const status = NuvioMediaProxy.proxyStatus(sessionId);
+        readAudioMetadata(status?.audioTracks);
+        if (status?.log) {
+          proxyLogTailRef.current = status.log.slice(-MAX_PROXY_LOG_CHARS);
+        }
+        return status;
+      } catch (err: any) {
+        console.warn('[VegaPlayer] proxyStatus failed:', err);
+        return null;
+      }
+    },
+    [readAudioMetadata],
+  );
+
+  /**
+   * Waits for a complete playback file. A stalled local download or a failed
+   * local remux is a real failure; slow but progressing work is not.
+   */
+  const waitForPlaybackReady = useCallback(
+    (sessionId: string, generation: number) =>
+      new Promise<MediaProxyStatus>((resolve, reject) => {
+        let timer: any = null;
+        let lastProgressAt = Date.now();
+        let lastPhase = '';
+        let lastBytes = -1;
+        let settled = false;
+
+        const finish = (callback: (value: any) => void, value: any) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          callback(value);
+        };
+
+        const tick = () => {
+          const status = readStatus(sessionId);
+          if (!status) {
+            finish(reject, new Error('Local media proxy is unavailable'));
+            return;
+          }
+          const phase = String(status.phase || status.state || '');
+          const bytes =
+            Number(status.masterBytes || 0) + Number(status.bytesWritten || 0);
+          if (phase !== lastPhase || bytes > lastBytes) {
+            lastPhase = phase;
+            lastBytes = bytes;
+            lastProgressAt = Date.now();
+          }
+          if (status.error) {
+            captureProxyLog();
+            finish(reject, new Error(status.error));
+            return;
+          }
+          const failedRebuild =
+            Number(status.playbackDone ?? 0) === 1 &&
+            Number(status.playbackInFlightGeneration ?? 0) === generation &&
+            Number(status.playbackGeneration ?? 0) !== generation &&
+            Boolean(status.playbackDiagnostic);
+          if (failedRebuild) {
+            captureProxyLog();
+            finish(
+              reject,
+              new Error(status.playbackDiagnostic || 'Local remux failed'),
+            );
+            return;
+          }
+          if (
+            status.state === 'ready' &&
+            Number(status.playbackGeneration ?? 0) === generation
+          ) {
+            finish(resolve, status);
+            return;
+          }
+          if (Date.now() - lastProgressAt > PROGRESS_STALL_MS) {
+            captureProxyLog();
+            finish(
+              reject,
+              new Error(
+                `Local media preparation stalled in ${
+                  phase || 'unknown'
+                } phase`,
+              ),
+            );
+            return;
+          }
+          timer = setTimeout(tick, STATUS_POLL_MS);
+        };
+        tick();
+      }),
+    [captureProxyLog, readStatus],
+  );
+
   const startPrerollWatchdog = useCallback(
     (url: string) => {
       clearPrerollWatchdog();
@@ -450,53 +539,48 @@ export const App = () => {
           return;
         }
         const target = videoRef.current;
-        // Do not treat readyState >= 2 as success: the GStreamer pipeline can
-        // expose metadata and then stall forever before canplay/playing.
         pushNativeLog(
           'preroll_timeout',
-          `dur=${target?.duration ?? '-'} audio=${extractAudioTracks().length}`,
+          `dur=${target?.duration ?? '-'} audio=${
+            extractAudioTracks().length
+          } retry=${prerollRetryRef.current}`,
         );
-        let proxyDiagnostic: unknown = null;
-        try {
-          if (proxySessionRef.current) {
-            proxyDiagnostic = NuvioMediaProxy.proxyStatus(proxySessionRef.current);
-          }
-        } catch (_) {
-          // Diagnostics must never hide the original playback failure.
+        // The first timeout is treated as a pipeline hiccup: rebuild from the
+        // local master and remount once before showing any error to the user.
+        if (!prerollRetryRef.current && proxySessionRef.current) {
+          prerollRetryRef.current = true;
+          restartPlaybackAtRef.current(sourceBaseTimeRef.current, {});
+          return;
         }
-        console.warn('[VegaPlayer] Native preroll timeout:', {
-          url,
-          readyState: Number(target?.readyState ?? 0),
-          networkState: Number(target?.networkState ?? 0),
-          duration: target?.duration,
-          proxyDiagnostic,
-          diagnosticLogs: [...nativeLogsRef.current],
-        });
-        try {
-          target?.pause?.();
-        } catch (_) {
-          // The watchdog still reports the original failure if pausing fails.
-        }
+        captureProxyLog();
         forwardNativeError(
           'native-preroll-timeout',
-          'Vega native player preroll timeout (pipeline stalled before canplay)',
+          'Vega native player could not render the local file',
           4,
           {
             url,
             readyState: Number(target?.readyState ?? 0),
             networkState: Number(target?.networkState ?? 0),
-            duration: target?.duration ?? 0,
+            duration: Number(target?.duration ?? 0),
             audioTracks: extractAudioTracks(),
             textTracks: extractTextTracks(),
+            proxyLog: proxyLogTailRef.current,
           },
         );
       }, NATIVE_PREROLL_TIMEOUT_MS);
     },
-    [clearPrerollWatchdog, extractAudioTracks, extractTextTracks, forwardNativeError, pushNativeLog],
+    [
+      captureProxyLog,
+      clearPrerollWatchdog,
+      extractAudioTracks,
+      extractTextTracks,
+      forwardNativeError,
+      pushNativeLog,
+    ],
   );
 
   const startProxySession = useCallback(
-    async (
+    (
       url: string,
       headers: Record<string, string> | null,
       startTimeSec: number,
@@ -509,7 +593,9 @@ export const App = () => {
         .slice(2, 8)}`;
       pushNativeLog(
         'proxy_start',
-        `time=${startTimeSec.toFixed(1)} headers=${Object.keys(headers || {}).join(',')} audio=${audioTrackIndex}/${audioTrackCount}`,
+        `time=${startTimeSec.toFixed(1)} headers=${Object.keys(
+          headers || {},
+        ).join(',')} audio=${audioTrackIndex}/${audioTrackCount}`,
       );
       const result = NuvioMediaProxy.startProxy({
         sessionId,
@@ -519,78 +605,94 @@ export const App = () => {
         audioTrackIndex,
         audioTrackCount,
       });
-      if (result?.error || !result?.localUrl) {
-        throw new Error(result?.error || 'Remuxer did not return a local URL');
+      if (result?.error) {
+        throw new Error(result.error);
+      }
+      if (!result?.localUrl) {
+        throw new Error('Remuxer did not return a local URL');
       }
       if (generation !== sourceGenerationRef.current) {
         NuvioMediaProxy.stopProxy(sessionId);
         return null;
       }
-      pushNativeLog('proxy_ready', `url=${result.localUrl} path=${result.cachePath}`);
+      proxySessionRef.current = sessionId;
+      lastProxySessionRef.current = sessionId;
+      localUrlRef.current = result.localUrl;
+      pushNativeLog('proxy_master_started', `url=${result.localUrl}`);
       return {sessionId, localUrl: result.localUrl};
     },
     [pushNativeLog],
   );
 
-  const startProxyPolling = useCallback(
-    (sessionId: string, generation: number, url: string) => {
+  const startStatusPolling = useCallback(
+    (sessionId: string, generation: number) => {
       stopProxyPolling();
       proxyPollRef.current = setInterval(() => {
-        if (generation !== sourceGenerationRef.current || sessionId !== proxySessionRef.current) {
+        if (
+          generation !== sourceGenerationRef.current ||
+          sessionId !== proxySessionRef.current
+        ) {
           stopProxyPolling();
           return;
         }
-        try {
-          const status = NuvioMediaProxy.proxyStatus(sessionId);
-          readAudioMetadata(status?.audioTracks);
-          const exitCode = Number(status?.exitCode ?? 0);
-          const failed =
-            Boolean(status?.error) ||
-            (status?.state === 'complete' && exitCode !== 0);
-          if (failed) {
-            stopProxyPolling();
-            clearPrerollWatchdog();
-            captureProxyLog();
-            if (hasPlayedOrCanPlayRef.current) {
-              // Once frames and audio have reached the native player, an ffmpeg
-              // exit is a diagnostic event, not a playback failure. The local
-              // file stays mounted; killing it here produced a false error
-              // screen over working video.
-              pushNativeLog(
-                'proxy_finished',
-                `exit=${exitCode} ${status?.error || 'remux ended'}`,
-              );
-              if (status?.log) {
-                pushNativeLog('proxy_log', status.log.slice(-600).replace(/\s+/g, ' '));
-              }
-              return;
-            }
-            stopProxyPlayback();
-            forwardNativeError(
-              'proxy-stream-failed',
-              status?.error || `Remux failed (exit ${exitCode || 'unknown'})`,
-              4,
-              {
-                url,
-                exitCode,
-                proxyLog: status?.log || '',
-              },
-            );
-          }
-        } catch (err: any) {
-          console.warn('[VegaPlayer] proxyStatus failed:', err);
-        }
-      }, 1000);
+        readStatus(sessionId);
+        sendAudioTracks();
+      }, LOG_POLL_MS);
     },
-    [
-      captureProxyLog,
-      clearPrerollWatchdog,
-      forwardNativeError,
-      pushNativeLog,
-      readAudioMetadata,
-      stopProxyPlayback,
-      stopProxyPolling,
-    ],
+    [readStatus, sendAudioTracks, stopProxyPolling],
+  );
+
+  const mountPlaybackFile = useCallback(
+    (localUrl: string) => {
+      hasPlayedOrCanPlayRef.current = false;
+      audioSignatureRef.current = '';
+      lastMountAtRef.current = Date.now();
+      isSwitchingRef.current = false;
+      setPlaybackKey((prev) => prev + 1);
+      setVideoUrl(localUrl);
+      startPrerollWatchdog(localUrl);
+      sendAudioTracks();
+    },
+    [sendAudioTracks, startPrerollWatchdog],
+  );
+
+  const rebuildPlayback = useCallback(
+    async (
+      sessionId: string,
+      localUrl: string,
+      timeSec: number,
+      generation: number,
+      options: RebuildOptions,
+    ) => {
+      const result = NuvioMediaProxy.preparePlayback({
+        sessionId,
+        startTimeSec: Math.max(0, timeSec),
+        audioTrackIndex:
+          options.audioTrackIndex ?? selectedAudioTrackRef.current,
+        audioTrackCount:
+          options.audioTrackCount ??
+          audioTrackCountRef.current ??
+          proxyAudioMetadataRef.current.length,
+        generation,
+      });
+      if (result?.error) {
+        throw new Error(result.error);
+      }
+      const status = await waitForPlaybackReady(sessionId, generation);
+      readAudioMetadata(status.audioTracks);
+      sourceBaseTimeRef.current = Math.max(0, timeSec);
+      if (options.notifySeeked) {
+        pendingSeekSecRef.current = Math.max(0, timeSec);
+      }
+      mountPlaybackFile(localUrl);
+      pushNativeLog(
+        'playback_rebuilt',
+        `time=${timeSec.toFixed(2)} generation=${generation} audio=${
+          options.audioTrackIndex ?? selectedAudioTrackRef.current
+        }`,
+      );
+    },
+    [mountPlaybackFile, pushNativeLog, readAudioMetadata, waitForPlaybackReady],
   );
 
   const applyProxySource = useCallback(
@@ -599,179 +701,169 @@ export const App = () => {
       headers: Record<string, string> | null,
       startTimeSec: number,
       generation: number,
-      audioTrackIndex?: number,
-      audioTrackCount?: number,
     ) => {
-      // The native player may still be reading the old file while ffmpeg
-      // prepares its replacement. Keep that file alive until the new src has
-      // been mounted and had time to open.
       stopProxyPlayback(PROXY_RETIRE_DELAY_MS);
       proxyAudioMetadataRef.current = [];
       audioSignatureRef.current = '';
-      const trackIndex =
-        typeof audioTrackIndex === 'number' && audioTrackIndex >= 0
-          ? audioTrackIndex
-          : selectedAudioTrackRef.current;
-      const trackCount =
-        typeof audioTrackCount === 'number' && audioTrackCount > 0
-          ? audioTrackCount
-          : audioTrackCountRef.current;
-      const session = await startProxySession(
+      const session = startProxySession(
         url,
         headers,
         startTimeSec,
         generation,
-        trackIndex,
-        trackCount,
+        selectedAudioTrackRef.current,
+        audioTrackCountRef.current,
       );
       if (!session || generation !== sourceGenerationRef.current) {
-        if (session) {
-          NuvioMediaProxy.stopProxy(session.sessionId);
-        }
         return;
       }
-      proxySessionRef.current = session.sessionId;
-      lastProxySessionRef.current = session.sessionId;
-      sourceBaseTimeRef.current = startTimeSec;
       sourceUrlRef.current = url;
       sourceHeadersRef.current = headers;
-      hasPlayedOrCanPlayRef.current = false;
-      targetLocalSecRef.current = 0;
-      // Mount the native player directly on the local URL. It must never see
-      // the remote URL, not even for a single frame while ffmpeg runs.
-      setPlaybackKey(prev => prev + 1);
-      setVideoUrl(session.localUrl);
-      startPrerollWatchdog(session.localUrl);
-      startProxyPolling(session.sessionId, generation, url);
-      startAudioTrackPolling(session.sessionId, generation);
+      playbackGenerationRef.current = generation;
+      startStatusPolling(session.sessionId, generation);
+      const status = await waitForPlaybackReady(session.sessionId, generation);
+      if (generation !== sourceGenerationRef.current) {
+        return;
+      }
+      readAudioMetadata(status.audioTracks);
+      pushNativeLog(
+        'proxy_ready',
+        `url=${session.localUrl} phase=${status.phase || 'ready'}`,
+      );
+      sourceBaseTimeRef.current = Math.max(0, startTimeSec);
+      mountPlaybackFile(session.localUrl);
     },
     [
-      startAudioTrackPolling,
-      startPrerollWatchdog,
-      startProxyPolling,
+      mountPlaybackFile,
+      pushNativeLog,
+      readAudioMetadata,
       startProxySession,
+      startStatusPolling,
       stopProxyPlayback,
+      waitForPlaybackReady,
     ],
   );
 
-  const restartProxyAt = useCallback(
-    async (
-      timeSec: number,
-      headersOverride?: Record<string, string> | null,
-      notifySeeked: boolean = false,
-      audioTrackIndex?: number,
-      audioTrackCount?: number,
-    ) => {
-      const url = sourceUrlRef.current;
-      if (!url) {
+  const restartPlaybackAtRef = useRef<
+    (timeSec: number, options?: RebuildOptions) => Promise<void>
+  >(async () => {});
+
+  const restartPlaybackAt = useCallback(
+    async (timeSec: number, options: RebuildOptions = {}) => {
+      const sessionId = proxySessionRef.current;
+      if (!sessionId) {
+        pushNativeLog('rebuild_skipped', 'no active local session');
         return;
       }
-      const headers =
-        headersOverride !== undefined ? headersOverride : sourceHeadersRef.current;
-      sourceHeadersRef.current = headers;
-      // Each restart supersedes any earlier in-flight remux.
-      const generation = sourceGenerationRef.current + 1;
-      sourceGenerationRef.current = generation;
-      isSeekingRef.current = true;
-      targetLocalSecRef.current = 0;
-      pendingSeekSecRef.current = notifySeeked ? timeSec : null;
-      if (seekTimeoutRef.current) {
-        clearTimeout(seekTimeoutRef.current);
-        seekTimeoutRef.current = null;
-      }
+      const generation =
+        sourceGenerationRef.current + ++playbackGenerationRef.current + 1000;
+      isSwitchingRef.current = true;
+      prerollRetryRef.current = false;
+      clearPrerollWatchdog();
       try {
-        await applyProxySource(
-          url,
-          headers,
-          Math.max(0, timeSec),
+        await rebuildPlayback(
+          sessionId,
+          localUrlRef.current || videoUrl,
+          timeSec,
           generation,
-          audioTrackIndex,
-          audioTrackCount,
+          options,
         );
       } catch (err: any) {
-        if (generation !== sourceGenerationRef.current) {
-          return;
+        const message = err?.message || String(err || 'local rebuild failed');
+        pushNativeLog('rebuild_failed', message);
+        isSwitchingRef.current = false;
+        if (options.audioTrackIndex !== undefined) {
+          sendAudioTracks();
         }
-        const message = err?.message || String(err || 'proxy restart failed');
-        pushNativeLog('proxy_restart_failed', message);
-        isSeekingRef.current = false;
-        pendingSeekSecRef.current = null;
-        stopProxyPlayback();
-        forwardNativeError('proxy-restart-failed', message, 4, {url, timeSec});
+        if (options.notifySeeked) {
+          sendEventToWeb({name: 'seeked', currentTime: reportedTime()});
+        }
+        // A failed seek/audio change is recoverable: the previous local file
+        // remains mounted and the movie keeps playing.
       }
     },
-    [applyProxySource, forwardNativeError, pushNativeLog, stopProxyPlayback],
+    [
+      clearPrerollWatchdog,
+      pushNativeLog,
+      rebuildPlayback,
+      reportedTime,
+      sendAudioTracks,
+      sendEventToWeb,
+      videoUrl,
+    ],
   );
-  restartProxyAtRef.current = restartProxyAt;
+  restartPlaybackAtRef.current = restartPlaybackAt;
 
   /**
-   * A file:// MKV is still being written by ffmpeg. GStreamer treats the
-   * current end of that file as EOS, so `ended` can arrive long before the
-   * movie is over. Distinguish that from a real end by asking the remuxer
-   * whether it is still streaming and whether it reported an error.
+   * The native file is complete before it is mounted, so `ended` is the real
+   * end of the movie. Ignore any early GStreamer EOS instead of leaving the
+   * player screen or showing an error over working video.
    */
   const handleNativeEnded = useCallback(() => {
-    const sessionId = proxySessionRef.current;
-    let status: ReturnType<typeof NuvioMediaProxy.proxyStatus> | null = null;
-    if (sessionId) {
-      try {
-        status = NuvioMediaProxy.proxyStatus(sessionId);
-      } catch (err) {
-        console.warn('[VegaPlayer] ended status failed:', err);
-      }
-    }
     const timeSec = reportedTime();
-    const remuxFailed = Boolean(status?.error) ||
-      (status?.state === 'complete' && Number(status?.exitCode ?? 0) !== 0);
-    if (remuxFailed) {
+    const durationSec = reportedDuration();
+    if (durationSec > 0 && timeSec < durationSec - 1) {
       pushNativeLog(
-        'ended_with_remux_error',
-        `time=${timeSec.toFixed(2)} state=${status?.state} exit=${status?.exitCode} error=${status?.error || ''}`,
-      );
-      captureProxyLog();
-      stopProxyPlayback();
-      forwardNativeError('proxy-stream-failed', status?.error || 'Remux failed', 4, {
-        url: sourceUrlRef.current,
-        proxyLog: proxyLogTailRef.current,
-      });
-      return;
-    }
-    const stillStreaming = Boolean(sessionId) && status?.state === 'streaming';
-    if (stillStreaming && prematureEndCountRef.current < MAX_PREMATURE_END_RECOVERIES) {
-      prematureEndCountRef.current += 1;
-      pushNativeLog(
-        'premature_end',
-        `time=${timeSec.toFixed(2)} bytes=${status?.bytesWritten ?? '-'} recovery=${prematureEndCountRef.current}`,
-      );
-      if (status?.log) {
-        pushNativeLog('proxy_log', status.log.slice(-600).replace(/\s+/g, ' '));
-      }
-      restartProxyAt(timeSec, undefined, false);
-      return;
-    }
-    if (stillStreaming) {
-      pushNativeLog('premature_end_giveup', `time=${timeSec.toFixed(2)}`);
-      captureProxyLog();
-      stopProxyPlayback();
-      forwardNativeError(
-        'proxy-stalled',
-        'The local remux stopped delivering frames before the movie ended',
-        4,
-        {url: sourceUrlRef.current, proxyLog: proxyLogTailRef.current},
+        'ended_ignored',
+        `time=${timeSec.toFixed(2)} duration=${durationSec.toFixed(2)}`,
       );
       return;
     }
     pushNativeLog('ended');
     sendEventToWeb({name: 'ended'});
-  }, [
-    captureProxyLog,
-    forwardNativeError,
-    pushNativeLog,
-    reportedTime,
-    restartProxyAt,
-    sendEventToWeb,
-    stopProxyPlayback,
-  ]);
+  }, [pushNativeLog, reportedDuration, reportedTime, sendEventToWeb]);
+
+  const handleNativeMediaError = useCallback(
+    (err: any) => {
+      clearPrerollWatchdog();
+      const mediaErr = err?.target?.error || videoRef.current?.error;
+      const code =
+        mediaErr?.code || (typeof err?.code === 'number' ? err.code : 4);
+      const rawMessage =
+        mediaErr?.message || err?.message || err?.name || 'Native player error';
+      const msg = mediaErr?.code
+        ? `${rawMessage} (code ${mediaErr.code})`
+        : rawMessage;
+      console.warn('[Vega Video onError]', msg, err, mediaErr);
+      pushNativeLog('native_media_error', msg);
+      captureProxyLog();
+
+      // Decoder errors immediately after a rebuild are often a transient
+      // reconfiguration. Retry once from the local master before considering
+      // the playback broken.
+      const now = Date.now();
+      if (
+        (isSwitchingRef.current || now - lastMountAtRef.current < 2000) &&
+        nativeErrorCountRef.current === 0
+      ) {
+        nativeErrorCountRef.current = 1;
+        lastNativeErrorAtRef.current = now;
+        restartPlaybackAtRef.current(reportedTime(), {});
+        return;
+      }
+      if (now - lastNativeErrorAtRef.current < MEDIA_ERROR_RETRY_WINDOW_MS) {
+        nativeErrorCountRef.current += 1;
+        if (nativeErrorCountRef.current < 2) {
+          return;
+        }
+      } else {
+        nativeErrorCountRef.current = 1;
+        lastNativeErrorAtRef.current = now;
+        return;
+      }
+      forwardNativeError('native-media-error', msg, code, {
+        sourceError: rawMessage,
+        errorName: err?.name,
+        proxyLog: proxyLogTailRef.current,
+      });
+    },
+    [
+      captureProxyLog,
+      clearPrerollWatchdog,
+      forwardNativeError,
+      pushNativeLog,
+      reportedTime,
+    ],
+  );
 
   const prepareSource = useCallback(async () => {
     const pending = pendingSourceRef.current;
@@ -785,17 +877,24 @@ export const App = () => {
     }
     preparingSourceRef.current = true;
     try {
-      pushNativeLog('source_probe', 'bundled ffmpeg remuxes the source locally');
+      pushNativeLog(
+        'source_probe',
+        'fetching source once into a local master file',
+      );
       await applyProxySource(url, headers, 0, generation);
     } catch (err: any) {
       if (generation !== sourceGenerationRef.current) {
         return;
       }
       clearPrerollWatchdog();
-      const message = err?.message || String(err || 'proxy setup failed');
+      const message =
+        err?.message || String(err || 'local media preparation failed');
       pushNativeLog('proxy_failed', message);
       stopProxyPlayback();
-      forwardNativeError('proxy-start-failed', message, 4, {url});
+      forwardNativeError('proxy-start-failed', message, 4, {
+        url,
+        proxyLog: proxyLogTailRef.current,
+      });
     } finally {
       if (generation === sourceGenerationRef.current) {
         preparingSourceRef.current = false;
@@ -813,23 +912,22 @@ export const App = () => {
     (url: string, incomingHeaders: Record<string, string> | null) => {
       clearPrerollWatchdog();
       stopProxyPlayback();
-      if (seekTimeoutRef.current) {
-        clearTimeout(seekTimeoutRef.current);
-        seekTimeoutRef.current = null;
-      }
       sourceGenerationRef.current += 1;
       preparingSourceRef.current = false;
       hasPlayedOrCanPlayRef.current = false;
-      isSeekingRef.current = false;
-      prematureEndCountRef.current = 0;
+      isSwitchingRef.current = false;
+      prerollRetryRef.current = false;
+      nativeErrorCountRef.current = 0;
       pendingSeekSecRef.current = null;
       proxyAudioMetadataRef.current = [];
       audioSignatureRef.current = '';
       nativeLogsRef.current = [];
       proxyLogTailRef.current = '';
+      playingRef.current = false;
       const headers =
-        incomingHeaders && Object.keys(incomingHeaders).length > 0 ? incomingHeaders : null;
-      customHeadersRef.current = headers;
+        incomingHeaders && Object.keys(incomingHeaders).length > 0
+          ? incomingHeaders
+          : null;
       sourceUrlRef.current = url;
       sourceHeadersRef.current = headers;
       sourceBaseTimeRef.current = 0;
@@ -841,11 +939,9 @@ export const App = () => {
         generation: sourceGenerationRef.current,
       };
       pushNativeLog('open', `hasHeaders=${Boolean(headers)}`);
-      setPlaybackKey(prev => prev + 1);
-      // Unmount any old native player immediately; the new one is mounted only
-      // after the proxy returns its local URL.
+      setPlaybackKey((prev) => prev + 1);
       setVideoUrl('');
-      setSourcePendingToken(prev => prev + 1);
+      setSourcePendingToken((prev) => prev + 1);
     },
     [clearPrerollWatchdog, pushNativeLog, stopProxyPlayback],
   );
@@ -858,225 +954,195 @@ export const App = () => {
           BackHandler.exitApp();
           return;
         }
-
         if (payload?.type === 'NUVIO_WAKE_LOCK') {
           console.info('[Vega] NUVIO_WAKE_LOCK:', payload.active);
           return;
         }
-
-        if (payload?.type === 'NUVIO_VEGA_PLAYER') {
-          const {action} = payload;
-
-          switch (action) {
-            case 'open':
-              if (payload.url) {
-                openSource(payload.url, payload.headers || null);
-              } else {
-                forwardNativeError('native-open-invalid-url', 'Native player received an empty playback URL', 4);
-              }
-              break;
-            case 'setHeaders':
-              if (payload.headers && typeof payload.headers === 'object') {
-                const merged = {...(customHeadersRef.current || {}), ...payload.headers};
-                if (Object.keys(merged).length > 0) {
-                  customHeadersRef.current = merged;
-                  if (pendingSourceRef.current) {
-                    pendingSourceRef.current.headers = merged;
-                    sourceHeadersRef.current = merged;
-                    if (!preparingSourceRef.current) {
-                      prepareSource();
-                    }
-                  } else if (proxySessionRef.current) {
-                    restartProxyAt(reportedTime(), merged);
-                  }
-                  pushNativeLog('setHeaders', `headers=${Object.keys(merged).join(',')}`);
+        if (payload?.type !== 'NUVIO_VEGA_PLAYER') {
+          return;
+        }
+        const {action} = payload;
+        switch (action) {
+          case 'open':
+            if (payload.url) {
+              openSource(payload.url, payload.headers || null);
+            } else {
+              forwardNativeError(
+                'native-open-invalid-url',
+                'Playback URL is empty',
+                4,
+              );
+            }
+            break;
+          case 'setHeaders':
+          case 'prepare': {
+            // Headers apply to the single master download. Late header updates
+            // cannot be used for a rebuild and must never restart the network.
+            if (payload.headers && typeof payload.headers === 'object') {
+              const merged = {
+                ...(sourceHeadersRef.current || {}),
+                ...payload.headers,
+              };
+              if (Object.keys(merged).length > 0) {
+                sourceHeadersRef.current = merged;
+                if (pendingSourceRef.current) {
+                  pendingSourceRef.current.headers = merged;
                 }
+                pushNativeLog('headers', `count=${Object.keys(merged).length}`);
               }
-              break;
-            case 'prepare':
-              if (payload.url && payload.url !== sourceUrlRef.current) {
-                openSource(payload.url, payload.headers || customHeadersRef.current);
-                break;
-              }
-              if (payload.headers && typeof payload.headers === 'object') {
-                const merged = {...(customHeadersRef.current || {}), ...payload.headers};
-                if (Object.keys(merged).length > 0) {
-                  const changed =
-                    JSON.stringify(merged) !== JSON.stringify(sourceHeadersRef.current || {});
-                  customHeadersRef.current = merged;
-                  if (pendingSourceRef.current) {
-                    pendingSourceRef.current.headers = merged;
-                    sourceHeadersRef.current = merged;
-                    if (!preparingSourceRef.current) {
-                      prepareSource();
-                    }
-                  } else if (proxySessionRef.current && changed) {
-                    restartProxyAt(reportedTime(), merged);
-                  }
-                }
-              }
-              pushNativeLog('prepare');
-              // Never synthesize canplay from readyState. Only the real Video onCanPlay
-              // callback may resolve prepareAsync(); a stalled audio pipeline can expose
-              // HAVE_CURRENT_DATA without ever becoming playable.
-              break;
-            case 'play':
-              try {
-                videoRef.current?.play()?.catch?.((err: any) => {
-                  reportNativeActionFailure('play', err);
-                });
-              } catch (err: any) {
-                reportNativeActionFailure('play', err);
-              }
-              break;
-            case 'pause':
-              try {
-                videoRef.current?.pause();
-              } catch (err) {
-                reportNativeActionFailure('pause', err);
-              }
-              break;
-            case 'seek': {
-              if (typeof payload.positionMs !== 'number' || !proxySessionRef.current) {
-                break;
-              }
-              const targetSec = Math.max(0, payload.positionMs / 1000);
-              targetSeekSecRef.current = targetSec;
-              prematureEndCountRef.current = 0;
-              // The remuxed MKV deliberately has no cues index. Native seeks land
-              // on a non-keyframe and the decoder reports "No valid frames
-              // decoded", so every seek rebuilds the file from the target time.
-              restartProxyAt(targetSec, undefined, true);
+            }
+            break;
+          }
+          case 'play':
+            playingRef.current = true;
+            try {
+              videoRef.current
+                ?.play()
+                ?.catch?.((err: any) => logControlFailure('play', err));
+            } catch (err: any) {
+              logControlFailure('play', err);
+            }
+            break;
+          case 'pause':
+            playingRef.current = false;
+            try {
+              videoRef.current?.pause();
+            } catch (err: any) {
+              logControlFailure('pause', err);
+            }
+            break;
+          case 'seek': {
+            if (
+              typeof payload.positionMs !== 'number' ||
+              !proxySessionRef.current
+            ) {
               break;
             }
-            case 'selectAudioTrack':
-              if (
-                typeof payload.index === 'number' &&
-                Number.isFinite(payload.index) &&
-                payload.index >= 0
-              ) {
-                const index = Math.floor(payload.index);
-                const trackCount =
-                  Number(payload.trackCount) > 0
-                    ? Math.floor(payload.trackCount)
-                    : proxyAudioMetadataRef.current.length ||
-                      audioTrackCountRef.current ||
-                      Number(videoRef.current?.audioTracks?.length || 0);
-                if (index === selectedAudioTrackRef.current && proxySessionRef.current) {
-                  break;
-                }
-                selectedAudioTrackRef.current = index;
-                audioTrackCountRef.current = trackCount;
-                pushNativeLog('selectAudioTrack', `index=${index} count=${trackCount}`);
-                // Best effort only: the remuxed file below is authoritative.
-                try {
-                  const list = videoRef.current?.audioTracks;
-                  if (list && typeof list.length === 'number') {
-                    for (let i = 0; i < list.length; i++) {
-                      if (list[i]) {
-                        list[i].enabled = i === index;
-                      }
-                    }
-                  }
-                } catch (err: any) {
-                  pushNativeLog('selectAudioTrack_native_skipped', err?.message || String(err));
-                }
-                sendEventToWeb({
-                  name: 'audiotracks',
-                  audioTracks: extractAudioTracks(index),
-                });
-                restartProxyAt(reportedTime(), undefined, false, index, trackCount).catch(
-                  (err: any) => {
-                    pushNativeLog(
-                      'selectAudioTrack_restart_failed',
-                      err?.message || String(err),
-                    );
-                  },
-                );
-              }
+            const targetSec = Math.max(0, payload.positionMs / 1000);
+            pushNativeLog('seek', `time=${targetSec.toFixed(2)}`);
+            restartPlaybackAt(targetSec, {notifySeeked: true});
+            break;
+          }
+          case 'selectAudioTrack': {
+            const index = Number(payload.index);
+            if (
+              !Number.isFinite(index) ||
+              index < 0 ||
+              !proxySessionRef.current
+            ) {
               break;
-            case 'selectTextTrack':
-              if (videoRef.current?.textTracks && typeof payload.index === 'number') {
-                try {
-                  const list = videoRef.current.textTracks;
-                  setShowCaptions(true);
-                  for (let i = 0; i < list.length; i++) {
-                    if (list[i]) {
-                      list[i].mode = i === payload.index ? 'showing' : 'disabled';
-                    }
-                  }
-                  sendEventToWeb({
-                    name: 'texttracks',
-                    textTracks: extractTextTracks(),
-                  });
-                } catch (err) {
-                  reportNativeActionFailure('selectTextTrack', err);
-                }
-              }
+            }
+            const trackIndex = Math.floor(index);
+            if (trackIndex === selectedAudioTrackRef.current) {
               break;
-            case 'setSilentSubtitle':
+            }
+            const trackCount =
+              Number(payload.trackCount) > 0
+                ? Math.floor(payload.trackCount)
+                : proxyAudioMetadataRef.current.length ||
+                  audioTrackCountRef.current;
+            selectedAudioTrackRef.current = trackIndex;
+            audioTrackCountRef.current = trackCount;
+            pushNativeLog(
+              'selectAudioTrack',
+              `index=${trackIndex} count=${trackCount}`,
+            );
+            // The rebuilt playback file has exactly one default audio track.
+            // Toggling native `enabled` here races that rebuild and makes Vega
+            // abort pending track reconfigurations, so the container flag is
+            // the only authoritative switch.
+            sendEventToWeb({
+              name: 'audiotracks',
+              audioTracks: extractAudioTracks(trackIndex),
+            });
+            restartPlaybackAt(reportedTime(), {
+              audioTrackIndex: trackIndex,
+              audioTrackCount: trackCount,
+            });
+            break;
+          }
+          case 'selectTextTrack':
+            if (
+              videoRef.current?.textTracks &&
+              typeof payload.index === 'number'
+            ) {
               try {
-                const silent = Boolean(payload.silent);
-                setShowCaptions(!silent);
-                const list = videoRef.current?.textTracks;
-                if (list && typeof list.length === 'number') {
-                  for (let i = 0; i < list.length; i++) {
-                    if (list[i] && silent) {
-                      list[i].mode = 'disabled';
-                    }
+                const list = videoRef.current.textTracks;
+                setShowCaptions(true);
+                for (let i = 0; i < list.length; i++) {
+                  if (list[i]) {
+                    list[i].mode = i === payload.index ? 'showing' : 'disabled';
                   }
                 }
                 sendEventToWeb({
                   name: 'texttracks',
                   textTracks: extractTextTracks(),
                 });
-              } catch (err) {
-                reportNativeActionFailure('setSilentSubtitle', err);
+              } catch (err: any) {
+                logControlFailure('selectTextTrack', err);
               }
-              break;
-            case 'rate':
-              if (typeof payload.rate === 'number' && videoRef.current) {
-                try {
-                  videoRef.current.playbackRate = payload.rate;
-                } catch (err) {
-                  reportNativeActionFailure('rate', err);
+            }
+            break;
+          case 'setSilentSubtitle':
+            try {
+              const silent = Boolean(payload.silent);
+              setShowCaptions(!silent);
+              const list = videoRef.current?.textTracks;
+              if (list && typeof list.length === 'number') {
+                for (let i = 0; i < list.length; i++) {
+                  if (list[i] && silent) {
+                    list[i].mode = 'disabled';
+                  }
                 }
               }
-              break;
-            case 'stop':
-              clearPrerollWatchdog();
-              pushNativeLog('stop');
+              sendEventToWeb({
+                name: 'texttracks',
+                textTracks: extractTextTracks(),
+              });
+            } catch (err: any) {
+              logControlFailure('setSilentSubtitle', err);
+            }
+            break;
+          case 'rate':
+            if (typeof payload.rate === 'number' && videoRef.current) {
               try {
-                videoRef.current?.pause();
-              } catch (err) {
-                reportNativeActionFailure('stop', err);
+                videoRef.current.playbackRate = payload.rate;
+              } catch (err: any) {
+                logControlFailure('rate', err);
               }
-              break;
-            case 'close':
-              clearPrerollWatchdog();
-              stopProxyPlayback();
-              sourceGenerationRef.current += 1;
-              preparingSourceRef.current = false;
-              pendingSourceRef.current = null;
-              hasPlayedOrCanPlayRef.current = false;
-              isSeekingRef.current = false;
-              pendingSeekSecRef.current = null;
-              proxyAudioMetadataRef.current = [];
-              audioSignatureRef.current = '';
-              nativeLogsRef.current = [];
-              proxyLogTailRef.current = '';
-              pushNativeLog('close');
-              if (seekTimeoutRef.current) {
-                clearTimeout(seekTimeoutRef.current);
-                seekTimeoutRef.current = null;
-              }
-              setVideoUrl('');
-              customHeadersRef.current = null;
-              sourceUrlRef.current = '';
-              sourceHeadersRef.current = null;
-              sourceBaseTimeRef.current = 0;
-              break;
-          }
+            }
+            break;
+          case 'stop':
+            clearPrerollWatchdog();
+            pushNativeLog('stop');
+            try {
+              videoRef.current?.pause();
+            } catch (err: any) {
+              logControlFailure('stop', err);
+            }
+            break;
+          case 'close':
+            clearPrerollWatchdog();
+            stopProxyPlayback();
+            sourceGenerationRef.current += 1;
+            preparingSourceRef.current = false;
+            hasPlayedOrCanPlayRef.current = false;
+            isSwitchingRef.current = false;
+            prerollRetryRef.current = false;
+            pendingSeekSecRef.current = null;
+            proxyAudioMetadataRef.current = [];
+            audioSignatureRef.current = '';
+            nativeLogsRef.current = [];
+            proxyLogTailRef.current = '';
+            playingRef.current = false;
+            pushNativeLog('close');
+            setVideoUrl('');
+            sourceUrlRef.current = '';
+            sourceHeadersRef.current = null;
+            sourceBaseTimeRef.current = 0;
+            break;
+          default:
+            break;
         }
       } catch (_) {
         // Ignore non-JSON messages from web content.
@@ -1087,12 +1153,11 @@ export const App = () => {
       extractAudioTracks,
       extractTextTracks,
       forwardNativeError,
+      logControlFailure,
       openSource,
-      prepareSource,
       pushNativeLog,
       reportedTime,
-      reportNativeActionFailure,
-      restartProxyAt,
+      restartPlaybackAt,
       sendEventToWeb,
       stopProxyPlayback,
     ],
@@ -1119,12 +1184,8 @@ export const App = () => {
     return () => {
       clearPrerollWatchdog();
       stopProxyPlayback();
-      retiredProxyTimersRef.current.forEach(timer => clearTimeout(timer));
+      retiredProxyTimersRef.current.forEach((timer) => clearTimeout(timer));
       retiredProxyTimersRef.current = [];
-      if (seekTimeoutRef.current) {
-        clearTimeout(seekTimeoutRef.current);
-        seekTimeoutRef.current = null;
-      }
     };
   }, [clearPrerollWatchdog, stopProxyPlayback]);
 
@@ -1145,15 +1206,10 @@ export const App = () => {
             showCaptions={showCaptions}
             scalingmode="fit"
             onComponentDidMount={() => {
-              console.info('[VegaPlayer] onComponentDidMount fired for:', videoUrl);
-              pushNativeLog('mount', `seek=${pendingSeekSecRef.current ?? '-'}`);
-              // The source is already proxied at this point. Do not prepare it
-              // here: the native Video must never be mounted with a remote URL.
-              if (seekTimeoutRef.current) {
-                clearTimeout(seekTimeoutRef.current);
-                seekTimeoutRef.current = null;
-              }
-              isSeekingRef.current = false;
+              pushNativeLog(
+                'mount',
+                `seek=${pendingSeekSecRef.current ?? '-'}`,
+              );
               if (pendingSeekSecRef.current !== null) {
                 const seekTarget = pendingSeekSecRef.current;
                 pendingSeekSecRef.current = null;
@@ -1164,7 +1220,11 @@ export const App = () => {
             onCanPlay={() => {
               hasPlayedOrCanPlayRef.current = true;
               clearPrerollWatchdog();
-              pushNativeLog('canplay', `dur=${videoRef.current?.duration ?? '-'}`);
+              nativeErrorCountRef.current = 0;
+              pushNativeLog(
+                'canplay',
+                `dur=${videoRef.current?.duration ?? '-'}`,
+              );
               sendEventToWeb({
                 name: 'canplay',
                 duration: reportedDuration(),
@@ -1174,7 +1234,10 @@ export const App = () => {
               });
             }}
             onLoadedMetadata={() => {
-              pushNativeLog('loadedmetadata', `dur=${videoRef.current?.duration ?? '-'}`);
+              pushNativeLog(
+                'loadedmetadata',
+                `dur=${videoRef.current?.duration ?? '-'}`,
+              );
               sendEventToWeb({
                 name: 'loadedmetadata',
                 duration: reportedDuration(),
@@ -1185,6 +1248,7 @@ export const App = () => {
             onPlaying={() => {
               hasPlayedOrCanPlayRef.current = true;
               clearPrerollWatchdog();
+              nativeErrorCountRef.current = 0;
               pushNativeLog('playing');
               sendEventToWeb({
                 name: 'playing',
@@ -1203,7 +1267,6 @@ export const App = () => {
                 readyState: videoRef.current?.readyState ?? 0,
                 networkState: videoRef.current?.networkState ?? 0,
                 duration: reportedDuration(),
-                diagnosticLogs: [...nativeLogsRef.current],
               });
             }}
             onStalled={() => {
@@ -1213,39 +1276,18 @@ export const App = () => {
                 readyState: videoRef.current?.readyState ?? 0,
                 networkState: videoRef.current?.networkState ?? 0,
                 duration: reportedDuration(),
-                diagnosticLogs: [...nativeLogsRef.current],
               });
             }}
             onSeeked={() => {
-              if (seekTimeoutRef.current) {
-                clearTimeout(seekTimeoutRef.current);
-                seekTimeoutRef.current = null;
-              }
-              isSeekingRef.current = false;
-              sendEventToWeb({
-                name: 'seeked',
-                currentTime: reportedTime(),
-              });
+              isSwitchingRef.current = false;
+              sendEventToWeb({name: 'seeked', currentTime: reportedTime()});
             }}
             onTimeUpdate={() => {
-              const current = videoRef.current?.currentTime;
-              if (
-                isSeekingRef.current &&
-                typeof current === 'number' &&
-                Math.abs(current - targetLocalSecRef.current) > 2.0
-              ) {
-                return;
-              }
-              if (isSeekingRef.current) {
-                isSeekingRef.current = false;
-                pendingSeekSecRef.current = null;
-              }
-              // Advancing native time is the strongest proof that real frames
-              // reached the display, even when onCanPlay/onPlaying are not
-              // delivered for file:// sources on Vega.
-              if (!hasPlayedOrCanPlayRef.current && typeof current === 'number' && current > 0.15) {
+              const current = Number(videoRef.current?.currentTime ?? 0);
+              if (!hasPlayedOrCanPlayRef.current && current > 0.15) {
                 hasPlayedOrCanPlayRef.current = true;
                 clearPrerollWatchdog();
+                nativeErrorCountRef.current = 0;
                 pushNativeLog('playback_started', `time=${current.toFixed(2)}`);
               }
               sendEventToWeb({
@@ -1255,28 +1297,7 @@ export const App = () => {
               });
             }}
             onEnded={handleNativeEnded}
-            onError={(err: any) => {
-              clearPrerollWatchdog();
-              if (seekTimeoutRef.current) {
-                clearTimeout(seekTimeoutRef.current);
-                seekTimeoutRef.current = null;
-              }
-              isSeekingRef.current = false;
-              captureProxyLog();
-              stopProxyPlayback();
-              const mediaErr = err?.target?.error || videoRef.current?.error;
-              const code = mediaErr?.code || (typeof err?.code === 'number' ? err.code : 4);
-              const rawMessage =
-                mediaErr?.message || err?.message || err?.name || 'Native player error';
-              const msg = mediaErr?.code
-                ? `${rawMessage} (code ${mediaErr.code})`
-                : rawMessage;
-              console.error('[Vega Video onError]', msg, err, mediaErr);
-              forwardNativeError('native-media-error', msg, code, {
-                sourceError: rawMessage,
-                errorName: err?.name,
-              });
-            }}
+            onError={handleNativeMediaError}
           />
         </View>
       ) : null}
@@ -1292,9 +1313,7 @@ export const App = () => {
         mediaPlaybackRequiresUserAction={false}
         mixedContentMode="compatibility"
         injectedJavaScriptBeforeContentLoaded={INJECTED_PRELOAD_JS}
-        source={{
-          uri: 'file:///pkg/assets/web/index.html',
-        }}
+        source={{uri: WEBVIEW_MAIN_URL}}
         onMessage={handleMessage}
         onLoad={(_event: WebViewNavigationEvent) => {
           console.info('Page loading completed...');
@@ -1310,7 +1329,9 @@ export const App = () => {
         onLoadStart={(_event: WebViewNavigationEvent) => {
           console.info('Page loading started...');
         }}
-        onError={({nativeEvent: {code, url, description}}: WebViewErrorEvent) => {
+        onError={({
+          nativeEvent: {code, url, description},
+        }: WebViewErrorEvent) => {
           const message = description || `WebView failed to load ${url}`;
           console.error(`[onError]: (${code}: ${url}) ${message}`);
           if (!isMainWebviewDocument(url)) {
@@ -1328,13 +1349,17 @@ export const App = () => {
             return;
           }
           hideSplashScreenCallback();
-          forwardNativeError('webview-http-error', message, code || 4, {url, isMainFrame});
+          forwardNativeError('webview-http-error', message, code || 4, {
+            url,
+            isMainFrame,
+          });
         }}
         onSslError={(
           {code, url, description}: SslErrorData,
           callback: {proceed: () => void; cancel: () => void},
         ) => {
-          const message = description || `SSL error ${code} while loading ${url}`;
+          const message =
+            description || `SSL error ${code} while loading ${url}`;
           console.error(`[onSslError]: (${code}: ${url}) ${message}`);
           callback?.cancel?.();
           if (!isMainWebviewDocument(url)) {

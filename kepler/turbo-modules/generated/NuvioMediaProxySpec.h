@@ -33,6 +33,7 @@ public:
   void aggregateMethods(com::amazon::kepler::turbomodule::MethodAggregator<KeplerTurboModule>& methodAggregator) const noexcept override;
 
   virtual com::amazon::kepler::turbomodule::JSObject startProxy(com::amazon::kepler::turbomodule::JSObject config) = 0;
+  virtual com::amazon::kepler::turbomodule::JSObject preparePlayback(com::amazon::kepler::turbomodule::JSObject config) = 0;
   virtual bool stopProxy(std::string sessionId) = 0;
   virtual com::amazon::kepler::turbomodule::JSObject proxyStatus(std::string sessionId) = 0;
   virtual std::string readProxyLog(std::string sessionId) = 0;

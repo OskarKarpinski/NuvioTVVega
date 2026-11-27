@@ -307,11 +307,20 @@ export const App = () => {
           'preroll_timeout',
           `dur=${target?.duration ?? '-'} audio=${extractAudioTracks().length}`,
         );
+        let proxyDiagnostic: unknown = null;
+        try {
+          if (proxySessionRef.current) {
+            proxyDiagnostic = NuvioMediaProxy.proxyStatus(proxySessionRef.current);
+          }
+        } catch (_) {
+          // Diagnostics must never hide the original playback failure.
+        }
         console.warn('[VegaPlayer] Native preroll timeout:', {
           url,
           readyState: Number(target?.readyState ?? 0),
           networkState: Number(target?.networkState ?? 0),
           duration: target?.duration,
+          proxyDiagnostic,
           diagnosticLogs: [...nativeLogsRef.current],
         });
         try {

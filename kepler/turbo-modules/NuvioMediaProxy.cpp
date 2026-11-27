@@ -67,6 +67,9 @@ struct ProxySession {
   bool needsRestart = false;
   int ffmpegExitCode = 0;
   long long punchedUpTo = 0;
+  long long clientRequests = 0;
+  long long clientBytesSent = 0;
+  std::string lastClientRange;
   std::string error;
   std::mutex mutex;
   std::condition_variable cv;
@@ -695,6 +698,12 @@ void handleClient(const std::shared_ptr<ProxySession>& session, int fd) {
     }
   }
 
+  {
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->clientRequests += 1;
+    session->lastClientRange = rangeHeader.empty() ? std::string("none") : rangeHeader;
+  }
+
   const long long available = fileSize(session->cachePath);
   if (available < 0) {
     sendStatus(fd, 503, "Service Unavailable", "Content-Type: video/x-matroska\r\n");
@@ -825,6 +834,10 @@ void handleClient(const std::shared_ptr<ProxySession>& session, int fd) {
       break;
     }
     sendAll(fd, chunk, static_cast<size_t>(count));
+    {
+      std::lock_guard<std::mutex> lock(session->mutex);
+      session->clientBytesSent += count;
+    }
     offset += count;
   }
   close(file);
@@ -1119,6 +1132,9 @@ JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
   result["exitCode"] = 0.0;
   result["error"] = std::string("");
   result["needsRestart"] = false;
+  result["clientRequests"] = 0.0;
+  result["clientBytesSent"] = 0.0;
+  result["lastClientRange"] = std::string("");
   {
     std::ifstream report("/tmp/nuvio-selftest.log");
     if (report) {
@@ -1146,6 +1162,9 @@ JSObject NuvioMediaProxy::proxyStatus(std::string sessionId) {
   result["exitCode"] = static_cast<double>(session->ffmpegExitCode);
   result["error"] = session->error;
   result["needsRestart"] = session->needsRestart;
+  result["clientRequests"] = static_cast<double>(session->clientRequests);
+  result["clientBytesSent"] = static_cast<double>(session->clientBytesSent);
+  result["lastClientRange"] = session->lastClientRange;
   return result;
 }
 

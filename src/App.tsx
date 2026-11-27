@@ -34,6 +34,7 @@ export const App = () => {
   const seekTimeoutRef = useRef<any>(null);
   const isSeekingRef = useRef<boolean>(false);
   const targetSeekSecRef = useRef<number>(0);
+  const appliedSrcRef = useRef<{url: string; headersStr: string} | null>(null);
   usePreventHideSplashScreen();
   const hideSplashScreenCallback = useHideSplashScreenCallback();
 
@@ -47,8 +48,48 @@ export const App = () => {
     }
   }, []);
 
+  const setVideoSource = useCallback((url: string, headers: Record<string, string> | null) => {
+    if (!url) return;
+    const target = videoRef.current;
+    if (!target) {
+      console.warn('[VegaPlayer] videoRef.current is null when setting source for:', url);
+      return;
+    }
+    const headersStr = headers ? JSON.stringify(headers) : '';
+    if (
+      appliedSrcRef.current &&
+      appliedSrcRef.current.url === url &&
+      appliedSrcRef.current.headersStr === headersStr
+    ) {
+      return;
+    }
+    appliedSrcRef.current = { url, headersStr };
+
+    const player = (target as any)?.mediaPlayer_ || target;
+    try {
+      if (headers && Object.keys(headers).length > 0 && typeof player?.setSrcWithCustomHeaders === 'function') {
+        console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders with headers:', url, headers);
+        player.setSrcWithCustomHeaders(url, headers);
+      } else if (typeof player?.setSrcWithCustomHeaders === 'function') {
+        console.info('[VegaPlayer] Calling player.setSrcWithCustomHeaders without headers:', url);
+        player.setSrcWithCustomHeaders(url, null);
+      } else {
+        console.info('[VegaPlayer] Setting target.src:', url);
+        target.src = url;
+      }
+    } catch (err) {
+      console.warn('[VegaPlayer] setVideoSource error:', err);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (videoUrl && videoRef.current) {
+      setVideoSource(videoUrl, customHeadersRef.current);
+    }
+  }, [videoUrl, setVideoSource]);
+
   const extractAudioTracks = useCallback(() => {
-    const tracks: Array<{index: number; label: string; language: string; enabled: boolean}> = [];
+    const tracks: Array<{index: number; id: string; kind: string; label: string; language: string; enabled: boolean}> = [];
     try {
       const list = videoRef.current?.audioTracks;
       if (list && typeof list.length === 'number') {
@@ -57,6 +98,8 @@ export const App = () => {
           if (item) {
             tracks.push({
               index: i,
+              id: item.id || String(i),
+              kind: item.kind || 'main',
               label: item.label || item.language || '',
               language: item.language || 'und',
               enabled: Boolean(item.enabled),
@@ -121,21 +164,10 @@ export const App = () => {
                     : null;
                 customHeadersRef.current = headers;
                 setCustomHeaders(headers);
+                appliedSrcRef.current = null;
                 setVideoUrl(payload.url);
                 if (videoRef.current) {
-                  if (headers && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
-                    try {
-                      videoRef.current.setSrcWithCustomHeaders(payload.url, headers);
-                    } catch (e) {
-                      console.warn('[VegaPlayer] open setSrcWithCustomHeaders error:', e);
-                    }
-                  } else {
-                    try {
-                      videoRef.current.src = payload.url;
-                    } catch (e) {
-                      console.warn('[VegaPlayer] open src error:', e);
-                    }
-                  }
+                  setVideoSource(payload.url, headers);
                 }
               }
               break;
@@ -144,12 +176,9 @@ export const App = () => {
                 const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
                 customHeadersRef.current = merged;
                 setCustomHeaders(merged);
-                if (videoRef.current && videoUrl && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
-                  try {
-                    videoRef.current.setSrcWithCustomHeaders(videoUrl, merged);
-                  } catch (e) {
-                    console.warn('[VegaPlayer] setHeaders setSrcWithCustomHeaders error:', e);
-                  }
+                appliedSrcRef.current = null;
+                if (videoUrl) {
+                  setVideoSource(videoUrl, merged);
                 }
               }
               break;
@@ -158,12 +187,10 @@ export const App = () => {
                 const merged = { ...(customHeadersRef.current || {}), ...payload.headers };
                 customHeadersRef.current = merged;
                 setCustomHeaders(merged);
-                if (videoRef.current && (payload.url || videoUrl) && typeof videoRef.current.setSrcWithCustomHeaders === 'function') {
-                  try {
-                    videoRef.current.setSrcWithCustomHeaders(payload.url || videoUrl, merged);
-                  } catch (e) {
-                    console.warn('[VegaPlayer] prepare setSrcWithCustomHeaders error:', e);
-                  }
+                appliedSrcRef.current = null;
+                const targetUrl = payload.url || videoUrl;
+                if (targetUrl) {
+                  setVideoSource(targetUrl, merged);
                 }
               }
               if (
@@ -183,18 +210,10 @@ export const App = () => {
             case 'play':
               try {
                 videoRef.current?.play()?.catch?.((err: any) => {
-                  console.error('[VegaPlayer] play failed:', err);
-                  sendEventToWeb({
-                    name: 'error',
-                    error: err?.message || 'Playback failed to start',
-                  });
+                  console.warn('[VegaPlayer] play rejected:', err);
                 });
               } catch (err: any) {
                 console.error('[VegaPlayer] play error:', err);
-                sendEventToWeb({
-                  name: 'error',
-                  error: err?.message || 'Playback failed to start',
-                });
               }
               break;
             case 'pause':
@@ -309,6 +328,7 @@ export const App = () => {
                 seekTimeoutRef.current = null;
               }
               isSeekingRef.current = false;
+              appliedSrcRef.current = null;
               setVideoUrl('');
               setCustomHeaders(null);
               customHeadersRef.current = null;
@@ -319,7 +339,7 @@ export const App = () => {
         // Ignore non-JSON messages from web content.
       }
     },
-    [sendEventToWeb, extractAudioTracks, extractTextTracks],
+    [sendEventToWeb, extractAudioTracks, extractTextTracks, videoUrl, setVideoSource],
   );
 
   return (
@@ -339,13 +359,10 @@ export const App = () => {
             showCaptions={showCaptions}
             scalingmode="fit"
             onComponentDidMount={() => {
-              if (customHeadersRef.current && videoRef.current && videoUrl) {
-                try {
-                  console.info('[VegaPlayer] Applying headers on mount for:', videoUrl);
-                  videoRef.current.setSrcWithCustomHeaders(videoUrl, customHeadersRef.current);
-                } catch (err) {
-                  console.warn('[VegaPlayer] onComponentDidMount setSrcWithCustomHeaders error:', err);
-                }
+              console.info('[VegaPlayer] onComponentDidMount fired for:', videoUrl);
+              appliedSrcRef.current = null;
+              if (videoUrl) {
+                setVideoSource(videoUrl, customHeadersRef.current);
               }
             }}
             onCanPlay={() => {
